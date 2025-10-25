@@ -34,6 +34,7 @@ class AdminAuditLog(Base):
 
     def to_dict(self):
         """Convert to dictionary"""
+        created_at_value = self.created_at  # type: ignore
         return {
             "id": self.id,
             "admin_id": self.admin_id,
@@ -43,7 +44,7 @@ class AdminAuditLog(Base):
             "changes": self.changes,
             "ip_address": self.ip_address,
             "reason": self.reason,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": created_at_value.isoformat() if created_at_value is not None else None,
             "is_deleted": self.is_deleted,
         }
 
@@ -85,6 +86,8 @@ class SystemAlert(Base):
 
     def to_dict(self):
         """Convert to dictionary"""
+        resolved_at_value = self.resolved_at  # type: ignore
+        created_at_value = self.created_at  # type: ignore
         return {
             "id": self.id,
             "alert_type": self.alert_type,
@@ -93,8 +96,8 @@ class SystemAlert(Base):
             "source": self.source,
             "details": self.details,
             "is_resolved": self.is_resolved,
-            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": resolved_at_value.isoformat() if resolved_at_value is not None else None,
+            "created_at": created_at_value.isoformat() if created_at_value is not None else None,
         }
 
 
@@ -129,6 +132,9 @@ class ReportSchedule(Base):
 
     def to_dict(self):
         """Convert to dictionary"""
+        last_generated_value = self.last_generated_at  # type: ignore
+        next_scheduled_value = self.next_scheduled_at  # type: ignore
+        created_at_value = self.created_at  # type: ignore
         return {
             "id": self.id,
             "admin_id": self.admin_id,
@@ -136,9 +142,9 @@ class ReportSchedule(Base):
             "frequency": self.frequency,
             "email_recipients": self.email_recipients,
             "is_active": self.is_active,
-            "last_generated_at": self.last_generated_at.isoformat() if self.last_generated_at else None,
-            "next_scheduled_at": self.next_scheduled_at.isoformat() if self.next_scheduled_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_generated_at": last_generated_value.isoformat() if last_generated_value is not None else None,
+            "next_scheduled_at": next_scheduled_value.isoformat() if next_scheduled_value is not None else None,
+            "created_at": created_at_value.isoformat() if created_at_value is not None else None,
         }
 
 
@@ -168,12 +174,18 @@ class DashboardMetric(Base):
 
     def to_dict(self):
         """Convert to dictionary"""
+        current_val = self.current_value  # type: ignore
+        previous_val = self.previous_value  # type: ignore
+        change_val = self.change_percent  # type: ignore
+        period_start_value = self.period_start  # type: ignore
+        period_end_value = self.period_end  # type: ignore
         return {
             "id": self.id,
             "metric_type": self.metric_type,
-            "current_value": float(self.current_value) if self.current_value else 0,
-            "previous_value": float(self.previous_value) if self.previous_value else 0,
-            "change_percent": float(self.change_percent) if self.change_percent else 0,
-            "period_start": self.period_start.isoformat() if self.period_start else None,
-            "period_end": self.period_end.isoformat() if self.period_end else None,
+            "current_value": float(current_val) if current_val is not None else 0,
+            "previous_value": float(previous_val) if previous_val is not None else 0,
+            "change_percent": float(change_val) if change_val is not None else 0,
+            "period_start": period_start_value.isoformat() if period_start_value is not None else None,
+            "period_end": period_end_value.isoformat() if period_end_value is not None else None,
+            "is_valid": self.is_valid,
         }
