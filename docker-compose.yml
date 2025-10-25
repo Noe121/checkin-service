@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  checkin-service:
+    build: .
+    ports:
+      - "8006:8000"
+    environment:
+      - DB_HOST=mysql-nilbx
+      - DB_PORT=3306
+      - DB_NAME=nilbx_db
+      - DB_USER=root
+      - DB_PASSWORD=rootpassword
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - TWITTER_API_KEY=${TWITTER_API_KEY}
+      - FEATURE_FLAG_URL=http://feature-flag-service:8004
+    depends_on:
+      - mysql
+    networks:
+      - checkin-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: checkin-mysql
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpassword
+      - MYSQL_DATABASE=nilbx_db
+      - MYSQL_USER=checkin_user
+      - MYSQL_PASSWORD=checkin_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - checkin_mysql_data:/var/lib/mysql
+      - ./init_checkin_db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - checkin-network
+
+volumes:
+  checkin_mysql_data:
+
+networks:
+  checkin-network:
+    driver: bridge
