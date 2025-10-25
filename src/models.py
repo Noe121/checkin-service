@@ -182,10 +182,10 @@ class DashboardMetric(Base):
         return {
             "id": self.id,
             "metric_type": self.metric_type,
-            "current_value": float(current_val) if current_val is not None else 0,
-            "previous_value": float(previous_val) if previous_val is not None else 0,
-            "change_percent": float(change_val) if change_val is not None else 0,
+            "current_value": float(current_val) if current_val is not None else 0,  # type: ignore
+            "previous_value": float(previous_val) if previous_val is not None else 0,  # type: ignore
+            "change_percent": float(change_val) if change_val is not None else 0,  # type: ignore
             "period_start": period_start_value.isoformat() if period_start_value is not None else None,
             "period_end": period_end_value.isoformat() if period_end_value is not None else None,
-            "is_valid": self.is_valid,
+            "is_cache_valid": self.is_cache_valid,
         }
