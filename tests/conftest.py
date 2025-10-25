@@ -8,10 +8,14 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Add src to path
+# Add src to path for runtime imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from models import Base
+try:
+    from models import Base
+except ImportError:
+    # Fallback for type checking
+    from ..src.models import Base  # type: ignore[import-not-found]
 
 
 @pytest.fixture(scope="session")
