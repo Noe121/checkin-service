@@ -1,314 +1,396 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-import mysql.connector
+"""
+Admin Dashboard Service - Main FastAPI Application
+Centralized administration interface for platform management
+"""
 import os
-import math
-from typing import Optional, Dict, Any, cast
 from datetime import datetime
-import requests
+from typing import List, Optional, Dict, Any
+from decimal import Decimal
 
-app = FastAPI(title="Check-in Service", version="1.0.0")
+from fastapi import FastAPI, HTTPException, Header, Query, Depends, Body
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 
-# Database configuration
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "rootpassword"),
-    "database": os.getenv("DB_NAME", "nilbx_db")
-}
+from models import Base, AdminAuditLog, SystemAlert, ReportSchedule, DashboardMetric, SeverityEnum
+from admin_service import AdminService
+from soft_delete import soft_delete_filter
 
-# API Keys
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-TWITTER_API_KEY = os.getenv("TWITTER_API_KEY", "")
-FEATURE_FLAG_URL = os.getenv("FEATURE_FLAG_URL", "http://localhost:8004")
+# ===== FastAPI Setup =====
 
-# Pydantic models
-class Location(BaseModel):
-    lat: float
-    lng: float
+app = FastAPI(
+    title="Admin Dashboard Service",
+    description="Centralized administration interface for platform management",
+    version="1.0.0"
+)
 
-class CheckinRequest(BaseModel):
-    deal_id: int
-    influencer_id: int
-    location: Location
+# ===== Database Configuration =====
 
-class SocialVerifyRequest(BaseModel):
-    social_url: str
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "mysql+pymysql://root:password@localhost:3306/nilbx_admin"
+)
 
-class GeoFence(BaseModel):
-    hotspot_name: str
-    deal_id: Optional[int] = None
-    lat_center: float
-    lng_center: float
-    radius_meters: int = 100
-    address: Optional[str] = None
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+)
 
-def get_db_connection():
-    """Get database connection"""
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+
+def get_db() -> Session:
+    """Get database session"""
+    db = SessionLocal()
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
-    except mysql.connector.Error as err:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {err}")
+        yield db
+    finally:
+        db.close()
 
-def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Calculate distance between two points in meters using Haversine formula"""
-    R = 6371000  # Earth's radius in meters
 
-    lat1_rad = math.radians(lat1)
-    lng1_rad = math.radians(lng1)
-    lat2_rad = math.radians(lat2)
-    lng2_rad = math.radians(lng2)
-
-    dlat = lat2_rad - lat1_rad
-    dlng = lng2_rad - lng1_rad
-
-    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlng/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-    return R * c
-
-def check_feature_flags():
-    """Check if check-in features are enabled"""
-    try:
-        response = requests.get(f"{FEATURE_FLAG_URL}/flags", timeout=5)
-        if response.status_code == 200:
-            flags = response.json()
-            return {
-                "geo_checkins": flags.get("enable_geo_checkins", True),
-                "social_verification": flags.get("enable_social_verification", True),
-                "auto_payout": flags.get("enable_auto_payout", True)
-            }
-    except:
-        pass
-    # Default to enabled if feature flag service is unavailable
-    return {
-        "geo_checkins": True,
-        "social_verification": True,
-        "auto_payout": True
-    }
+# ===== Health Check =====
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint"""
-    flags = check_feature_flags()
     return {
         "status": "healthy",
-        "service": "checkin-service",
-        "feature_flags": flags,
-        "timestamp": datetime.utcnow().isoformat()
+        "service": "admin-dashboard-service",
+        "timestamp": datetime.utcnow().isoformat(),
+        "feature_flags": {
+            "audit_logging": True,
+            "alert_management": True,
+            "report_scheduling": True,
+            "metrics_tracking": True,
+        }
     }
 
-@app.post("/checkins")
-async def create_checkin(request: CheckinRequest):
-    """Create a check-in with geo-fence verification"""
-    flags = check_feature_flags()
-    if not flags["geo_checkins"]:
-        raise HTTPException(status_code=403, detail="Geo check-ins are currently disabled")
 
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+# ===== Dashboard Endpoints =====
 
+@app.get("/admin/dashboard")
+def get_dashboard_overview(
+    admin_id: int = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get dashboard overview with key metrics"""
+    service = AdminService(db)
+    summary = service.get_dashboard_summary()
+
+    # Get latest metrics
+    metrics = {}
+    for metric_type in ["users", "deals", "revenue", "disputes"]:
+        latest = service.get_latest_metric(metric_type)
+        if latest:
+            metrics[metric_type] = latest.to_dict()
+
+    return {
+        "summary": summary,
+        "metrics": metrics,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+# ===== Audit Log Endpoints =====
+
+@app.get("/admin/audit-logs")
+def get_audit_logs(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    admin_id: Optional[int] = Query(None),
+    action: Optional[str] = Query(None),
+    entity_type: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Get audit logs with filtering"""
+    service = AdminService(db)
+    
+    filters = {}
+    if admin_id:
+        filters["admin_id"] = admin_id
+    if action:
+        filters["action"] = action
+    if entity_type:
+        filters["entity_type"] = entity_type
+
+    logs = service.get_audit_logs(skip=skip, limit=limit, filters=filters)
+    total = service.get_audit_log_count(filters=filters)
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "items": [log.to_dict() for log in logs],
+    }
+
+
+@app.post("/admin/audit-logs")
+def create_audit_log(
+    admin_id: int = Header(...),
+    action: str = Body(...),
+    entity_type: str = Body(...),
+    entity_id: Optional[int] = Body(None),
+    changes: Optional[Dict[str, Any]] = Body(None),
+    reason: Optional[str] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Create new audit log entry"""
+    service = AdminService(db)
+    
+    log = service.log_action(
+        admin_id=admin_id,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        changes=changes,
+        reason=reason,
+    )
+
+    return {
+        "id": log.id,
+        "message": "Audit log created successfully",
+        "audit_log": log.to_dict(),
+    }
+
+
+# ===== System Alert Endpoints =====
+
+@app.get("/admin/alerts")
+def get_alerts(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    only_unresolved: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    """Get system alerts"""
+    service = AdminService(db)
+    
+    alerts = service.get_alerts(skip=skip, limit=limit, only_unresolved=only_unresolved)
+    total = service.get_alert_count(only_unresolved=only_unresolved)
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "items": [alert.to_dict() for alert in alerts],
+    }
+
+
+@app.get("/admin/alerts/active")
+def get_active_alerts(db: Session = Depends(get_db)):
+    """Get active/unresolved alerts"""
+    service = AdminService(db)
+    alerts = service.get_active_alerts(limit=50)
+    
+    return {
+        "total": len(alerts),
+        "items": [alert.to_dict() for alert in alerts],
+    }
+
+
+@app.post("/admin/alerts")
+def create_alert(
+    alert_type: str = Body(...),
+    message: str = Body(...),
+    severity: str = Body("MEDIUM"),
+    source: Optional[str] = Body(None),
+    details: Optional[Dict[str, Any]] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Create a new system alert"""
+    service = AdminService(db)
+    
     try:
-        # Get geo-fence for this deal
-        cursor.execute("""
-            SELECT lat_center, lng_center, radius_meters
-            FROM geo_fences
-            WHERE deal_id = %s AND active = TRUE
-            LIMIT 1
-        """, (request.deal_id,))
+        severity_enum = SeverityEnum(severity)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid severity: {severity}")
 
-        fence = cast(Optional[Dict[str, Any]], cursor.fetchone())
-        if not fence:
-            raise HTTPException(status_code=400, detail="No active geo-fence found for this deal")
+    alert = service.create_alert(
+        alert_type=alert_type,
+        message=message,
+        severity=severity_enum,
+        source=source,
+        details=details,
+    )
 
-        # Calculate distance
-        distance = haversine(
-            request.location.lat, request.location.lng,
-            fence['lat_center'], fence['lng_center']
-        )
+    return {
+        "id": alert.id,
+        "message": "Alert created successfully",
+        "alert": alert.to_dict(),
+    }
 
-        geo_verified = distance <= fence['radius_meters']
 
-        # Save check-in
-        cursor.execute("""
-            INSERT INTO checkins (
-                deal_id, athlete_id, location_lat, location_lng,
-                geo_verified, status, checkin_time
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            request.deal_id, request.influencer_id,
-            request.location.lat, request.location.lng,
-            geo_verified, 'pending' if geo_verified else 'rejected',
-            datetime.utcnow()
-        ))
+@app.put("/admin/alerts/{alert_id}/resolve")
+def resolve_alert(
+    alert_id: int,
+    admin_id: int = Header(...),
+    resolution_notes: Optional[str] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Resolve a system alert"""
+    service = AdminService(db)
+    
+    alert = service.resolve_alert(
+        alert_id=alert_id,
+        admin_id=admin_id,
+        resolution_notes=resolution_notes,
+    )
 
-        checkin_id = cursor.lastrowid
-        conn.commit()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
 
-        # Get deal payout amount
-        cursor.execute("SELECT amount FROM deals WHERE id = %s", (request.deal_id,))
-        deal = cast(Optional[Dict[str, Any]], cursor.fetchone())
-        payout = deal['amount'] if deal else 0
+    return {
+        "id": alert.id,
+        "message": "Alert resolved successfully",
+        "alert": alert.to_dict(),
+    }
 
-        return {
-            "id": checkin_id,
-            "geo_verified": geo_verified,
-            "distance_meters": round(distance),
-            "payout": payout,
-            "status": 'pending' if geo_verified else 'rejected',
-            "message": "Geo-verified! Post on social media to complete check-in." if geo_verified else f"Not at hotspot. Distance: {round(distance)}m"
-        }
 
-    except mysql.connector.Error as err:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {err}")
-    finally:
-        cursor.close()
-        conn.close()
+# ===== Report Schedule Endpoints =====
 
-@app.post("/checkins/{checkin_id}/social-verify")
-async def verify_social(checkin_id: int, request: SocialVerifyRequest):
-    """Verify social media post for check-in"""
-    flags = check_feature_flags()
-    if not flags["social_verification"]:
-        raise HTTPException(status_code=403, detail="Social verification is currently disabled")
+@app.get("/admin/reports/schedules")
+def get_report_schedules(db: Session = Depends(get_db)):
+    """Get all active report schedules"""
+    service = AdminService(db)
+    schedules = service.get_active_schedules()
 
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+    return {
+        "total": len(schedules),
+        "items": [schedule.to_dict() for schedule in schedules],
+    }
 
+
+@app.post("/admin/reports/schedules")
+def create_report_schedule(
+    admin_id: int = Header(...),
+    report_type: str = Body(...),
+    frequency: str = Body(...),
+    email_recipients: Optional[List[str]] = Body(None),
+    parameters: Optional[Dict[str, Any]] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Create a new report schedule"""
+    service = AdminService(db)
+    
+    schedule = service.create_report_schedule(
+        admin_id=admin_id,
+        report_type=report_type,
+        frequency=frequency,
+        email_recipients=email_recipients,
+        parameters=parameters,
+    )
+
+    return {
+        "id": schedule.id,
+        "message": "Report schedule created successfully",
+        "schedule": schedule.to_dict(),
+    }
+
+
+@app.put("/admin/reports/schedules/{schedule_id}")
+def update_report_schedule(
+    schedule_id: int,
+    is_active: Optional[bool] = Body(None),
+    frequency: Optional[str] = Body(None),
+    email_recipients: Optional[List[str]] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Update a report schedule"""
+    service = AdminService(db)
+    
+    updates = {}
+    if is_active is not None:
+        updates["is_active"] = is_active
+    if frequency is not None:
+        updates["frequency"] = frequency
+    if email_recipients is not None:
+        updates["email_recipients"] = email_recipients
+
+    schedule = service.update_report_schedule(schedule_id, **updates)
+
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    return {
+        "id": schedule.id,
+        "message": "Schedule updated successfully",
+        "schedule": schedule.to_dict(),
+    }
+
+
+# ===== Dashboard Metrics Endpoints =====
+
+@app.get("/admin/metrics/{metric_type}")
+def get_metric(
+    metric_type: str,
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Get metrics of a specific type"""
+    service = AdminService(db)
+    metrics = service.get_metrics_by_type(metric_type, limit=limit)
+
+    return {
+        "metric_type": metric_type,
+        "total": len(metrics),
+        "items": [metric.to_dict() for metric in metrics],
+    }
+
+
+@app.post("/admin/metrics")
+def create_metric(
+    metric_type: str = Body(...),
+    current_value: float = Body(...),
+    period_start: str = Body(...),
+    period_end: str = Body(...),
+    previous_value: Optional[float] = Body(None),
+    description: Optional[str] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Create a dashboard metric"""
+    service = AdminService(db)
+    
     try:
-        # Check if check-in exists and is geo-verified
-        cursor.execute("""
-            SELECT deal_id, athlete_id, geo_verified
-            FROM checkins
-            WHERE id = %s
-        """, (checkin_id,))
+        period_start_dt = datetime.fromisoformat(period_start)
+        period_end_dt = datetime.fromisoformat(period_end)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid datetime format")
 
-        checkin = cast(Optional[Dict[str, Any]], cursor.fetchone())
-        if not checkin:
-            raise HTTPException(status_code=404, detail="Check-in not found")
-        if not checkin['geo_verified']:
-            raise HTTPException(status_code=400, detail="Check-in must be geo-verified first")
+    metric = service.create_metric(
+        metric_type=metric_type,
+        current_value=Decimal(str(current_value)),
+        period_start=period_start_dt,
+        period_end=period_end_dt,
+        previous_value=Decimal(str(previous_value)) if previous_value else None,
+        description=description,
+    )
 
-        # Verify social post (simplified - in real implementation would check APIs)
-        social_verified = await verify_social_post(request.social_url)
+    return {
+        "id": metric.id,
+        "message": "Metric created successfully",
+        "metric": metric.to_dict(),
+    }
 
-        # Update check-in
-        status = 'verified' if social_verified else 'rejected'
-        cursor.execute("""
-            UPDATE checkins
-            SET social_post_url = %s, social_verified = %s, status = %s
-            WHERE id = %s
-        """, (request.social_url, social_verified, status, checkin_id))
 
-        conn.commit()
+@app.post("/admin/metrics/invalidate")
+def invalidate_metrics(
+    metric_type: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Invalidate metrics cache"""
+    service = AdminService(db)
+    count = service.invalidate_metrics(metric_type)
 
-        # Trigger auto-payout if enabled and verified
-        if social_verified and flags["auto_payout"]:
-            await trigger_payout(checkin_id, checkin['deal_id'], checkin['athlete_id'])
+    return {
+        "message": "Metrics invalidated successfully",
+        "count": count,
+    }
 
-        return {
-            "verified": social_verified,
-            "status": status,
-            "auto_payout_triggered": social_verified and flags["auto_payout"]
-        }
-
-    except mysql.connector.Error as err:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.post("/geo-fences")
-async def create_geo_fence(fence: GeoFence):
-    """Create a geo-fence for a hotspot"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute("""
-            INSERT INTO geo_fences (
-                hotspot_name, deal_id, lat_center, lng_center,
-                radius_meters, address, active
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            fence.hotspot_name, fence.deal_id, fence.lat_center,
-            fence.lng_center, fence.radius_meters, fence.address, True
-        ))
-
-        fence_id = cursor.lastrowid
-        conn.commit()
-
-        return {"id": fence_id, "message": "Geo-fence created successfully"}
-
-    except mysql.connector.Error as err:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.get("/geo-fences/{deal_id}")
-async def get_geo_fences(deal_id: int):
-    """Get geo-fences for a deal"""
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-
-    try:
-        cursor.execute("""
-            SELECT * FROM geo_fences
-            WHERE deal_id = %s AND active = TRUE
-        """, (deal_id,))
-
-        fences = cursor.fetchall()
-        return {"geo_fences": fences}
-
-    except mysql.connector.Error as err:
-        raise HTTPException(status_code=500, detail=f"Database error: {err}")
-    finally:
-        cursor.close()
-        conn.close()
-
-async def verify_social_post(social_url: str) -> bool:
-    """Verify social media post contains required tags (simplified)"""
-    # In a real implementation, this would:
-    # 1. Parse the URL to determine platform (Twitter, Instagram, etc.)
-    # 2. Use platform APIs to fetch post content
-    # 3. Check for @nilbx and hotspot tags
-    # 4. Verify post was made within time window
-
-    # For now, just check if URL contains expected patterns
-    if not social_url:
-        return False
-
-    # Simplified check - in real implementation would use APIs
-    return "@nilbx" in social_url.lower() or "#nilbx" in social_url.lower()
-
-async def trigger_payout(checkin_id: int, deal_id: int, influencer_id: int):
-    """Trigger automatic payout to athlete"""
-    try:
-        # Get payout amount from deal
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("SELECT amount FROM deals WHERE id = %s", (deal_id,))
-        deal = cast(Optional[Dict[str, Any]], cursor.fetchone())
-
-        if deal:
-            payout_amount = deal['amount']
-            # In real implementation, this would call the payment service
-            # For now, just log the payout trigger
-            print(f"Auto-payout triggered: ${payout_amount} for influencer {influencer_id}, check-in {checkin_id}")
-
-        cursor.close()
-        conn.close()
-
-    except Exception as e:
-        print(f"Error triggering payout: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8006)
+    uvicorn.run(app, host="0.0.0.0", port=8005)
