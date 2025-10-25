@@ -28,6 +28,11 @@ except ImportError:
     from ..src.admin_service import AdminService  # type: ignore[import-not-found]
 
 
+# Type ignore for SQLAlchemy ORM assertions
+# Pylance struggles with SQLAlchemy Column types in assert statements
+# These are safe to ignore as they are testing ORM objects
+
+
 # ===== Database Setup =====
 
 @pytest.fixture(scope="session")
@@ -79,7 +84,7 @@ class TestAuditLogs:
         assert log.entity_type == "deal"
         assert log.entity_id == 100
         assert log.reason == "Suspicious activity detected"
-        assert log.is_deleted is False
+        assert log.is_deleted is False  # type: ignore[reportGeneralTypeIssues]
 
     def test_get_audit_logs(self, db_session: Session):
         """Test retrieving audit logs"""
@@ -165,7 +170,7 @@ class TestSystemAlerts:
         assert alert.alert_type == "error"
         assert alert.message == "Database connection failed"
         assert alert.severity == SeverityEnum.CRITICAL
-        assert alert.is_resolved is False
+        assert alert.is_resolved is False  # type: ignore[reportGeneralTypeIssues]
 
     def test_get_active_alerts(self, db_session: Session):
         """Test getting active/unresolved alerts"""
@@ -173,7 +178,7 @@ class TestSystemAlerts:
         
         # Create resolved alert
         alert1 = service.create_alert("info", "Test message 1", SeverityEnum.LOW)
-        service.resolve_alert(alert1.id, admin_id=1)
+        service.resolve_alert(alert1.id, admin_id=1)  # type: ignore[reportArgumentType]
 
         # Create unresolved alerts
         alert2 = service.create_alert("error", "Test message 2", SeverityEnum.HIGH)
@@ -199,17 +204,18 @@ class TestSystemAlerts:
         service = AdminService(db_session)
         
         alert = service.create_alert("error", "Test error", SeverityEnum.HIGH)
-        assert alert.is_resolved is False
+        assert alert.is_resolved is False  # type: ignore[reportGeneralTypeIssues]
 
         resolved = service.resolve_alert(
-            alert.id,
+            alert.id,  # type: ignore[reportArgumentType]
             admin_id=5,
             resolution_notes="Fixed the issue"
         )
 
-        assert resolved.is_resolved is True
-        assert resolved.resolved_by == 5
-        assert resolved.resolution_notes == "Fixed the issue"
+        assert resolved is not None  # type: ignore[reportGeneralTypeIssues]
+        assert resolved.is_resolved is True  # type: ignore[reportGeneralTypeIssues]
+        assert resolved.resolved_by == 5  # type: ignore[reportOptionalMemberAccess]
+        assert resolved.resolution_notes == "Fixed the issue"  # type: ignore[reportOptionalMemberAccess,reportGeneralTypeIssues]
 
     def test_alert_count_by_type(self, db_session: Session):
         """Test counting alerts"""
@@ -244,10 +250,10 @@ class TestReportSchedules:
         )
 
         assert schedule.id is not None
-        assert schedule.admin_id == 1
-        assert schedule.report_type == "financial"
-        assert schedule.frequency == "daily"
-        assert schedule.is_active is True
+        assert schedule.admin_id == 1  # type: ignore
+        assert schedule.report_type == "financial"  # type: ignore
+        assert schedule.frequency == "daily"  # type: ignore
+        assert schedule.is_active is True  # type: ignore
 
     def test_get_active_schedules(self, db_session: Session):
         """Test getting active schedules"""
@@ -259,7 +265,7 @@ class TestReportSchedules:
 
         # Create inactive schedule
         schedule3 = service.create_report_schedule(1, "performance", "monthly")
-        service.update_report_schedule(schedule3.id, is_active=False)
+        service.update_report_schedule(schedule3.id, is_active=False)  # type: ignore
 
         active = service.get_active_schedules()
         assert len(active) == 2
@@ -274,23 +280,25 @@ class TestReportSchedules:
         )
 
         updated = service.update_report_schedule(
-            schedule.id,
+            schedule.id,  # type: ignore
             frequency="weekly",
             email_recipients=["admin@example.com", "finance@example.com"]
         )
 
-        assert updated.frequency == "weekly"
-        assert len(updated.email_recipients or []) == 2
+        assert updated is not None  # type: ignore
+        assert updated.frequency == "weekly"  # type: ignore
+        assert len(updated.email_recipients or []) == 2  # type: ignore
 
     def test_deactivate_schedule(self, db_session: Session):
         """Test deactivating a report schedule"""
         service = AdminService(db_session)
         
         schedule = service.create_report_schedule(1, "financial", "daily")
-        assert schedule.is_active is True
+        assert schedule.is_active is True  # type: ignore
 
-        updated = service.update_report_schedule(schedule.id, is_active=False)
-        assert updated.is_active is False
+        updated = service.update_report_schedule(schedule.id, is_active=False)  # type: ignore
+        assert updated is not None  # type: ignore
+        assert updated.is_active is False  # type: ignore
 
 
 # ===== Dashboard Metrics Tests =====
@@ -315,9 +323,9 @@ class TestDashboardMetrics:
         )
 
         assert metric.id is not None
-        assert metric.metric_type == "users"
-        assert metric.current_value == Decimal("1500")
-        assert metric.change_percent == Decimal("7.14")  # (1500-1400)/1400*100
+        assert metric.metric_type == "users"  # type: ignore
+        assert metric.current_value == Decimal("1500")  # type: ignore
+        assert metric.change_percent == Decimal("7.14")  # type: ignore  # (1500-1400)/1400*100
 
     def test_get_metrics_by_type(self, db_session: Session):
         """Test retrieving metrics by type"""
@@ -348,8 +356,9 @@ class TestDashboardMetrics:
         metric2 = service.create_metric("revenue", Decimal("5500"), start, end)
 
         latest = service.get_latest_metric("revenue")
-        assert latest.id == metric2.id
-        assert latest.current_value == Decimal("5500")
+        assert latest is not None  # type: ignore
+        assert latest.id == metric2.id  # type: ignore
+        assert latest.current_value == Decimal("5500")  # type: ignore
 
     def test_invalidate_metrics(self, db_session: Session):
         """Test invalidating metrics cache"""
@@ -424,8 +433,9 @@ class TestIntegration:
         assert alert.is_resolved is False
 
         # 3. Resolve the alert
-        resolved = service.resolve_alert(alert.id, admin_id=1, resolution_notes="Approved")
-        assert resolved.is_resolved is True
+        resolved = service.resolve_alert(alert.id, admin_id=1, resolution_notes="Approved")  # type: ignore
+        assert resolved is not None  # type: ignore
+        assert resolved.is_resolved is True  # type: ignore
 
         # 4. Create report schedule
         schedule = service.create_report_schedule(
