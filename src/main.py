@@ -4,7 +4,7 @@ Centralized administration interface for platform management
 """
 import os
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Generator
 from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException, Header, Query, Depends, Body
@@ -43,7 +43,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base.metadata.create_all(bind=engine)
 
 
-def get_db() -> Session:
+def get_db() -> Generator[Session, Any, None]:
     """Get database session"""
     db = SessionLocal()
     try:
