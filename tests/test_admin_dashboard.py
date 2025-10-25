@@ -13,11 +13,19 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from models import (
-    Base, AdminAuditLog, SystemAlert, ReportSchedule, 
-    DashboardMetric, SeverityEnum
-)
-from admin_service import AdminService
+try:
+    from models import (
+        Base, AdminAuditLog, SystemAlert, ReportSchedule, 
+        DashboardMetric, SeverityEnum
+    )
+    from admin_service import AdminService
+except ImportError:
+    # Fallback for type checking
+    from ..src.models import (  # type: ignore[import-not-found]
+        Base, AdminAuditLog, SystemAlert, ReportSchedule, 
+        DashboardMetric, SeverityEnum
+    )
+    from ..src.admin_service import AdminService  # type: ignore[import-not-found]
 
 
 # ===== Database Setup =====
