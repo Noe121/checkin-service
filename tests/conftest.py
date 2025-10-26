@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 try:
-    from models import Base
+    from src.models import Base
 except ImportError:
     # Fallback for type checking
     from ..src.models import Base  # type: ignore[import-not-found]

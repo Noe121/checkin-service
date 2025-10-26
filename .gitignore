@@ -155,8 +155,28 @@ docker-compose.override.yml
 
 # Node (if using any frontend build tools)
 node_modules/
-npm-debug.log
-yarn-error.log
+# Node modules
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment files
+.env*
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Coverage
+coverage/
+
+# IDE files
+.vscode/
+.idea/
 
 # Lock files (optional - uncomment if you want to track them)
 # poetry.lock

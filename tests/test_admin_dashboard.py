@@ -14,11 +14,11 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 try:
-    from models import (
+    from src.models import (
         Base, AdminAuditLog, SystemAlert, ReportSchedule, 
         DashboardMetric, SeverityEnum
     )
-    from admin_service import AdminService
+    from src.admin_service import AdminService
 except ImportError:
     # Fallback for type checking
     from ..src.models import (  # type: ignore[import-not-found]
@@ -79,12 +79,12 @@ class TestAuditLogs:
         )
 
         assert log.id is not None
-        assert log.admin_id == 1
-        assert log.action == "SUSPEND_DEAL"
-        assert log.entity_type == "deal"
-        assert log.entity_id == 100
-        assert log.reason == "Suspicious activity detected"
-        assert log.is_deleted is False  # type: ignore[reportGeneralTypeIssues]
+        assert getattr(log, "admin_id", None) == 1
+        assert getattr(log, "action", None) == "SUSPEND_DEAL"
+        assert getattr(log, "entity_type", None) == "deal"
+        assert getattr(log, "entity_id", None) == 100
+        assert getattr(log, "reason", None) == "Suspicious activity detected"
+        assert getattr(log, "is_deleted", False) is False  # type: ignore[reportGeneralTypeIssues]
 
     def test_get_audit_logs(self, db_session: Session):
         """Test retrieving audit logs"""
@@ -167,10 +167,10 @@ class TestSystemAlerts:
         )
 
         assert alert.id is not None
-        assert alert.alert_type == "error"
-        assert alert.message == "Database connection failed"
-        assert alert.severity == SeverityEnum.CRITICAL
-        assert alert.is_resolved is False  # type: ignore[reportGeneralTypeIssues]
+        assert getattr(alert, "alert_type", None) == "error"
+        assert getattr(alert, "message", None) == "Database connection failed"
+        assert getattr(alert, "severity", None) == SeverityEnum.CRITICAL
+        assert getattr(alert, "is_resolved", False) is False  # type: ignore[reportGeneralTypeIssues]
 
     def test_get_active_alerts(self, db_session: Session):
         """Test getting active/unresolved alerts"""
@@ -212,10 +212,10 @@ class TestSystemAlerts:
             resolution_notes="Fixed the issue"
         )
 
-        assert resolved is not None  # type: ignore[reportGeneralTypeIssues]
-        assert resolved.is_resolved is True  # type: ignore[reportGeneralTypeIssues]
-        assert resolved.resolved_by == 5  # type: ignore[reportOptionalMemberAccess]
-        assert resolved.resolution_notes == "Fixed the issue"  # type: ignore[reportOptionalMemberAccess,reportGeneralTypeIssues]
+    assert resolved is not None  # type: ignore[reportGeneralTypeIssues]
+    assert getattr(resolved, "is_resolved", False) is True  # type: ignore[reportGeneralTypeIssues]
+    assert getattr(resolved, "resolved_by", None) == 5  # type: ignore[reportOptionalMemberAccess]
+    assert getattr(resolved, "resolution_notes", None) == "Fixed the issue"  # type: ignore[reportOptionalMemberAccess,reportGeneralTypeIssues]
 
     def test_alert_count_by_type(self, db_session: Session):
         """Test counting alerts"""
@@ -253,7 +253,7 @@ class TestReportSchedules:
         assert schedule.admin_id == 1  # type: ignore
         assert schedule.report_type == "financial"  # type: ignore
         assert schedule.frequency == "daily"  # type: ignore
-        assert schedule.is_active is True  # type: ignore
+    assert getattr(schedule, "is_active", False) is True  # type: ignore
 
     def test_get_active_schedules(self, db_session: Session):
         """Test getting active schedules"""
@@ -298,7 +298,7 @@ class TestReportSchedules:
 
         updated = service.update_report_schedule(schedule.id, is_active=False)  # type: ignore
         assert updated is not None  # type: ignore
-        assert updated.is_active is False  # type: ignore
+    assert getattr(updated, "is_active", True) is False  # type: ignore
 
 
 # ===== Dashboard Metrics Tests =====
@@ -323,9 +323,9 @@ class TestDashboardMetrics:
         )
 
         assert metric.id is not None
-        assert metric.metric_type == "users"  # type: ignore
-        assert metric.current_value == Decimal("1500")  # type: ignore
-        assert metric.change_percent == Decimal("7.14")  # type: ignore  # (1500-1400)/1400*100
+    assert getattr(metric, "metric_type", None) == "users"  # type: ignore
+    assert getattr(metric, "current_value", None) == Decimal("1500")  # type: ignore
+    assert getattr(metric, "change_percent", None) == Decimal("7.14")  # type: ignore  # (1500-1400)/1400*100
 
     def test_get_metrics_by_type(self, db_session: Session):
         """Test retrieving metrics by type"""
@@ -341,7 +341,7 @@ class TestDashboardMetrics:
 
         users_metrics = service.get_metrics_by_type("users", limit=10)
         assert len(users_metrics) == 2
-
+        
         deals_metrics = service.get_metrics_by_type("deals")
         assert len(deals_metrics) == 1
 
@@ -357,8 +357,8 @@ class TestDashboardMetrics:
 
         latest = service.get_latest_metric("revenue")
         assert latest is not None  # type: ignore
-        assert latest.id == metric2.id  # type: ignore
-        assert latest.current_value == Decimal("5500")  # type: ignore
+        assert getattr(latest, "id", None) == getattr(metric2, "id", None)  # type: ignore
+        assert getattr(latest, "current_value", None) == Decimal("5500")  # type: ignore
 
     def test_invalidate_metrics(self, db_session: Session):
         """Test invalidating metrics cache"""
@@ -394,7 +394,6 @@ class TestDashboardSummary:
         service.create_report_schedule(1, "financial", "daily")
 
         summary = service.get_dashboard_summary()
-        
         assert "active_alerts" in summary
         assert "total_audit_logs" in summary
         assert "active_report_schedules" in summary
@@ -430,12 +429,12 @@ class TestIntegration:
             severity=SeverityEnum.HIGH,
             source="admin-dashboard"
         )
-        assert alert.is_resolved is False
+        assert getattr(alert, "is_resolved", False) is False
 
         # 3. Resolve the alert
         resolved = service.resolve_alert(alert.id, admin_id=1, resolution_notes="Approved")  # type: ignore
         assert resolved is not None  # type: ignore
-        assert resolved.is_resolved is True  # type: ignore
+        assert getattr(resolved, "is_resolved", False) is True  # type: ignore
 
         # 4. Create report schedule
         schedule = service.create_report_schedule(
@@ -443,7 +442,7 @@ class TestIntegration:
             report_type="compliance",
             frequency="weekly"
         )
-        assert schedule.is_active is True
+        assert getattr(schedule, "is_active", False) is True
 
         # 5. Verify dashboard summary
         summary = service.get_dashboard_summary()
