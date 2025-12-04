@@ -4,7 +4,7 @@ services:
   checkin-service:
     build: .
     ports:
-      - "8006:8000"
+      - "8006:8006"
     environment:
       - DB_HOST=mysql-nilbx
       - DB_PORT=3306
@@ -13,7 +13,7 @@ services:
       - DB_PASSWORD=rootpassword
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - TWITTER_API_KEY=${TWITTER_API_KEY}
-      - FEATURE_FLAG_URL=http://feature-flag-service:8004
+      - FEATURE_FLAG_URL=http://feature-flag-service:8083
     depends_on:
       - mysql
     networks:

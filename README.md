@@ -17,7 +17,7 @@ A FastAPI-based microservice for geo-fencing and social verification check-ins i
 ### Service Overview
 - **Framework**: FastAPI with async support
 - **Database**: MySQL 8.0 with InnoDB engine
-- **Port**: 8006 (internal), 8000 (container)
+- **Port**: 8006 (internal and container)
 - **Health Checks**: Integrated with feature flag service
 - **Containerized**: Docker with multi-stage builds
 
@@ -295,7 +295,7 @@ tests/
 The service is designed to run in Docker containers with the following configuration:
 
 - **Base Image**: `python:3.11-slim`
-- **Port Mapping**: `8006:8000` (external:internal)
+- **Port Mapping**: `8006:8006` (external:internal)
 - **Health Checks**: Integrated with container orchestration
 - **Database Dependencies**: Requires MySQL service
 
