@@ -1547,7 +1547,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     location_address TEXT,
     location_lat DECIMAL(10, 8) NOT NULL COMMENT 'Latitude: -90.00000000 to 90.00000000',
     location_lng DECIMAL(11, 8) NOT NULL COMMENT 'Longitude: -180.00000000 to 180.00000000',
-    location_point POINT NOT NULL COMMENT 'Spatial point for indexing',
+    location_point POINT SRID 4326 NOT NULL COMMENT 'Spatial point for indexing',
     geofence_radius_meters INT DEFAULT 100,
 
     -- Spatial index for efficient geofence queries
@@ -1579,7 +1579,7 @@ CREATE TABLE IF NOT EXISTS check_ins (
     -- Location (CORRECTED)
     check_in_lat DECIMAL(10, 8) NOT NULL,
     check_in_lng DECIMAL(11, 8) NOT NULL,
-    check_in_point POINT NOT NULL,
+    check_in_point POINT SRID 4326 NOT NULL,
 
     target_lat DECIMAL(10, 8) NULL,
     target_lng DECIMAL(11, 8) NULL,
@@ -1591,6 +1591,23 @@ CREATE TABLE IF NOT EXISTS check_ins (
 
     SPATIAL INDEX idx_check_in_point (check_in_point)
 ) ENGINE=InnoDB;
+
+-- Triggers to hydrate check_in_point from lat/lng
+CREATE TRIGGER before_insert_check_in
+BEFORE INSERT ON check_ins
+FOR EACH ROW
+SET NEW.check_in_point = ST_GeomFromText(
+    CONCAT('POINT(', NEW.check_in_lng, ' ', NEW.check_in_lat, ')'),
+    4326
+);
+
+CREATE TRIGGER before_update_check_in
+BEFORE UPDATE ON check_ins
+FOR EACH ROW
+SET NEW.check_in_point = ST_GeomFromText(
+    CONCAT('POINT(', NEW.check_in_lng, ' ', NEW.check_in_lat, ')'),
+    4326
+);
 ```
 
 **Query Example:**
@@ -1864,14 +1881,25 @@ def cancel_participation(participant_id, reason):
         .filter_by(id=participant.contract_id)\
         .one()
 
-    # Update participant
+    # Capture current status BEFORE changing
+    prior_status = participant.status
+
+    # Update participant to cancelled
     participant.status = 'cancelled'
     participant.cancellation_reason = reason
     participant.cancelled_at = datetime.utcnow()
 
-    # Decrement slot count (if previously counted)
-    if participant.status in ['accepted', 'in_progress']:
+    # Decrement slot count ONLY if participant was previously in active states
+    # (Don't decrement if already cancelled, rejected, or in terminal states)
+    SLOT_COUNTED_STATES = ['accepted', 'in_progress', 'completed', 'approved']
+
+    if prior_status in SLOT_COUNTED_STATES:
         contract.filled_slots = max(0, contract.filled_slots - 1)
+        logger.info(
+            f"Decremented slots for contract {contract.id} "
+            f"due to participant {participant_id} cancellation "
+            f"(prior status: {prior_status})"
+        )
 
     db.session.commit()
 
