@@ -42,14 +42,19 @@ app = FastAPI(
 
 
 def get_db():
-    """Get database connection"""
+    """Get database connection with proper cleanup"""
+    conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         logger.info("Database connection established")
-        return conn
+        yield conn
     except mysql.connector.Error as err:
         logger.error(f"Database connection failed: {err}")
         raise HTTPException(status_code=500, detail=f"Database connection failed: {err}")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+            logger.info("Database connection closed")
 
 
 # ===== Health Check =====
@@ -62,6 +67,25 @@ def health_check():
         "service": "checkin-service",
         "timestamp": datetime.utcnow().isoformat()
     }
+
+
+@app.get("/db-health")
+def database_health_check(db=Depends(get_db)):
+    """Database health check endpoint with connection test"""
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        return {
+            "status": "healthy",
+            "service": "checkin-service",
+            "database": "connected",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
 
 
 if __name__ == "__main__":
