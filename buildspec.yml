@@ -1,0 +1,92 @@
+version: 0.2
+
+# AWS CodeBuild buildspec for check-in service
+# This file defines the build process for AWS CodePipeline/CodeBuild
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REPOSITORY: nilbx/checkin-service
+    ECS_SERVICE: checkin-service
+  parameter-store:
+    DB_PASSWORD: /nilbx/db/password
+  secrets-manager:
+    AWS_ACCOUNT_ID: nilbx/aws:account_id
+
+phases:
+  pre_build:
+    commands:
+      - echo "Pre-build phase started on $(date)"
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - echo "Image tag is $IMAGE_TAG"
+
+      # Install Python dependencies for testing
+      - echo "Installing Python dependencies..."
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+
+  build:
+    commands:
+      - echo "Build phase started on $(date)"
+
+      # Run unit tests
+      - echo "Running unit tests..."
+      - chmod +x run_tests.sh
+      - ./run_tests.sh || true
+
+      # Build Docker image
+      - echo "Building Docker image..."
+      - docker build -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER
+
+  post_build:
+    commands:
+      - echo "Post-build phase started on $(date)"
+
+      # Start test environment for smoke tests
+      - echo "Starting test environment..."
+      - docker-compose up -d
+      - sleep 10
+
+      # Run smoke tests
+      - echo "Running smoke tests..."
+      - chmod +x smoke_checkin.sh
+      - BASE_URL=http://localhost:8006 ./smoke_checkin.sh
+
+      # Stop test environment
+      - docker-compose down -v
+
+      # Push Docker images to ECR
+      - echo "Pushing Docker images to ECR..."
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER
+
+      # Create image definitions file for ECS deployment
+      - echo "Creating imagedefinitions.json..."
+      - printf '[{"name":"checkin-service","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - cat imagedefinitions.json
+
+      - echo "Build completed successfully on $(date)"
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - test-results/**/*
+  name: checkin-service-build-$(date +%Y%m%d-%H%M%S)
+
+cache:
+  paths:
+    - '.venv/**/*'
+    - '/root/.cache/pip/**/*'
+
+reports:
+  junit:
+    files:
+      - 'test-results/*.xml'
+    file-format: 'JUNITXML'

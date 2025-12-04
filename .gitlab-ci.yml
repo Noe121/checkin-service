@@ -1,0 +1,185 @@
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  AWS_REGION: us-east-1
+  ECS_CLUSTER_DEV: nilbx-dev-cluster
+  ECS_CLUSTER_PROD: nilbx-prod-cluster
+  ECS_SERVICE: checkin-service
+  MYSQL_ROOT_PASSWORD: rootpassword
+  MYSQL_DATABASE: nilbx_db
+
+stages:
+  - test
+  - build
+  - smoke-test
+  - deploy
+
+.python-base:
+  image: python:3.11
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+
+# ===== TEST STAGE =====
+
+lint:
+  extends: .python-base
+  stage: test
+  script:
+    - echo "Running linting (add flake8, mypy, etc. if needed)"
+    # - flake8 src/
+    # - mypy src/
+  allow_failure: true
+
+unit-test:
+  extends: .python-base
+  stage: test
+  services:
+    - mysql:8.0
+  variables:
+    MYSQL_ROOT_PASSWORD: rootpassword
+    MYSQL_DATABASE: nilbx_db
+    DB_HOST: mysql
+    DB_PORT: "3306"
+    DB_USER: root
+    DB_PASSWORD: rootpassword
+    DB_NAME: nilbx_db
+  script:
+    - chmod +x run_tests.sh
+    - ./run_tests.sh
+  artifacts:
+    when: always
+    reports:
+      junit: test-results/*.xml
+    paths:
+      - test-results/
+
+# ===== BUILD STAGE =====
+
+build-docker:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $DOCKER_IMAGE:$CI_COMMIT_REF_NAME
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - docker push $DOCKER_IMAGE:$CI_COMMIT_REF_NAME
+    - |
+      if [ "$CI_COMMIT_REF_NAME" == "main" ]; then
+        docker tag $DOCKER_IMAGE:$DOCKER_TAG $DOCKER_IMAGE:latest
+        docker push $DOCKER_IMAGE:latest
+      fi
+  only:
+    - main
+    - develop
+
+# ===== SMOKE TEST STAGE =====
+
+smoke-test:
+  extends: .python-base
+  stage: smoke-test
+  services:
+    - name: mysql:8.0
+      alias: mysql
+  variables:
+    MYSQL_ROOT_PASSWORD: rootpassword
+    MYSQL_DATABASE: nilbx_db
+    DB_HOST: mysql
+    DB_PORT: "3306"
+    DB_USER: root
+    DB_PASSWORD: rootpassword
+    DB_NAME: nilbx_db
+  script:
+    # Start the service in background
+    - cd src && python main.py &
+    - sleep 5
+    - cd ..
+
+    # Run smoke tests
+    - chmod +x smoke_checkin.sh
+    - BASE_URL=http://localhost:8006 ./smoke_checkin.sh
+  dependencies:
+    - unit-test
+
+# ===== DEPLOY STAGE =====
+
+.deploy-base:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  before_script:
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - export AWS_DEFAULT_REGION=$AWS_REGION
+
+deploy-dev:
+  extends: .deploy-base
+  environment:
+    name: development
+    url: https://dev.nilbx.com
+  script:
+    # Login to ECR
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+    # Tag and push to ECR
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $ECR_REGISTRY/checkin-service:$DOCKER_TAG
+    - docker push $ECR_REGISTRY/checkin-service:$DOCKER_TAG
+
+    # Update ECS service
+    - |
+      aws ecs update-service \
+        --cluster $ECS_CLUSTER_DEV \
+        --service $ECS_SERVICE \
+        --force-new-deployment \
+        --region $AWS_REGION
+
+    # Wait for deployment to stabilize
+    - |
+      aws ecs wait services-stable \
+        --cluster $ECS_CLUSTER_DEV \
+        --services $ECS_SERVICE \
+        --region $AWS_REGION
+  only:
+    - develop
+  dependencies:
+    - build-docker
+    - smoke-test
+
+deploy-prod:
+  extends: .deploy-base
+  environment:
+    name: production
+    url: https://nilbx.com
+  script:
+    # Login to ECR
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+    # Tag and push to ECR
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $ECR_REGISTRY/checkin-service:$DOCKER_TAG
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $ECR_REGISTRY/checkin-service:latest
+    - docker push $ECR_REGISTRY/checkin-service:$DOCKER_TAG
+    - docker push $ECR_REGISTRY/checkin-service:latest
+
+    # Update ECS service
+    - |
+      aws ecs update-service \
+        --cluster $ECS_CLUSTER_PROD \
+        --service $ECS_SERVICE \
+        --force-new-deployment \
+        --region $AWS_REGION
+
+    # Wait for deployment to stabilize
+    - |
+      aws ecs wait services-stable \
+        --cluster $ECS_CLUSTER_PROD \
+        --services $ECS_SERVICE \
+        --region $AWS_REGION
+  only:
+    - main
+  when: manual
+  dependencies:
+    - build-docker
+    - smoke-test
