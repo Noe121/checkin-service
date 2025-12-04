@@ -1527,13 +1527,1281 @@ Platform Health:
 
 ---
 
-## 12. Conclusion
+## 12. Production Readiness - Critical Gaps & Mitigations
+
+### 12.1 Data Model Hardening
+
+#### 12.1.1 Geospatial Indexing (CRITICAL FIX)
+
+**Problem:** JSON columns cannot be efficiently indexed for geofence queries.
+
+**Solution:** Use MySQL spatial data types with proper indexing.
+
+```sql
+-- UPDATED contracts table location fields
+CREATE TABLE IF NOT EXISTS contracts (
+    -- ... other fields ...
+
+    -- Location (CORRECTED for performance)
+    location_name VARCHAR(255) NOT NULL,
+    location_address TEXT,
+    location_lat DECIMAL(10, 8) NOT NULL COMMENT 'Latitude: -90.00000000 to 90.00000000',
+    location_lng DECIMAL(11, 8) NOT NULL COMMENT 'Longitude: -180.00000000 to 180.00000000',
+    location_point POINT NOT NULL COMMENT 'Spatial point for indexing',
+    geofence_radius_meters INT DEFAULT 100,
+
+    -- Spatial index for efficient geofence queries
+    SPATIAL INDEX idx_location_point (location_point),
+    INDEX idx_location_coords (location_lat, location_lng)
+) ENGINE=InnoDB;
+
+-- Create spatial point from lat/lng on insert/update
+CREATE TRIGGER before_insert_contract
+BEFORE INSERT ON contracts
+FOR EACH ROW
+SET NEW.location_point = ST_GeomFromText(
+    CONCAT('POINT(', NEW.location_lng, ' ', NEW.location_lat, ')'),
+    4326  -- WGS84 spatial reference system
+);
+
+CREATE TRIGGER before_update_contract
+BEFORE UPDATE ON contracts
+FOR EACH ROW
+SET NEW.location_point = ST_GeomFromText(
+    CONCAT('POINT(', NEW.location_lng, ' ', NEW.location_lat, ')'),
+    4326
+);
+
+-- UPDATED check_ins table
+CREATE TABLE IF NOT EXISTS check_ins (
+    -- ... other fields ...
+
+    -- Location (CORRECTED)
+    check_in_lat DECIMAL(10, 8) NOT NULL,
+    check_in_lng DECIMAL(11, 8) NOT NULL,
+    check_in_point POINT NOT NULL,
+
+    target_lat DECIMAL(10, 8) NULL,
+    target_lng DECIMAL(11, 8) NULL,
+    distance_from_target_meters DECIMAL(10, 2) NULL,
+
+    -- Validation
+    location_accuracy_meters DECIMAL(10, 2) NULL COMMENT 'GPS accuracy from device',
+    within_geofence BOOLEAN DEFAULT FALSE,
+
+    SPATIAL INDEX idx_check_in_point (check_in_point)
+) ENGINE=InnoDB;
+```
+
+**Query Example:**
+```sql
+-- Find contracts within 50km of user's current location
+SELECT c.*,
+       ST_Distance_Sphere(
+           c.location_point,
+           ST_GeomFromText('POINT(-74.0060 40.7128)', 4326)
+       ) AS distance_meters
+FROM contracts c
+WHERE c.status = 'active'
+  AND ST_Distance_Sphere(
+      c.location_point,
+      ST_GeomFromText('POINT(-74.0060 40.7128)', 4326)
+  ) <= 50000
+ORDER BY distance_meters ASC;
+```
+
+#### 12.1.2 Timezone Handling (CRITICAL)
+
+**Problem:** Event times must be unambiguous across timezones.
+
+**Solution:**
+
+```sql
+-- Add timezone fields to contracts
+ALTER TABLE contracts ADD COLUMN (
+    event_timezone VARCHAR(50) DEFAULT 'UTC' COMMENT 'IANA timezone: America/New_York',
+
+    -- Store all datetimes in UTC
+    event_start_datetime DATETIME NOT NULL COMMENT 'UTC timestamp',
+    event_end_datetime DATETIME NOT NULL COMMENT 'UTC timestamp',
+    check_in_window_start DATETIME COMMENT 'UTC timestamp',
+    check_in_window_end DATETIME COMMENT 'UTC timestamp',
+
+    -- Display times in event timezone (generated columns)
+    event_start_local AS (
+        CONVERT_TZ(event_start_datetime, 'UTC', event_timezone)
+    ) VIRTUAL,
+    event_end_local AS (
+        CONVERT_TZ(event_end_datetime, 'UTC', event_timezone)
+    ) VIRTUAL
+);
+
+-- Standard for ALL datetime fields across platform
+-- Rule: Store in UTC, display in user/event timezone
+```
+
+**Application Layer:**
+```python
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+def create_contract(event_start_local, event_timezone):
+    """
+    Convert local event time to UTC for storage
+    """
+    tz = ZoneInfo(event_timezone)  # e.g., 'America/New_York'
+    local_dt = datetime.fromisoformat(event_start_local)
+    aware_dt = local_dt.replace(tzinfo=tz)
+    utc_dt = aware_dt.astimezone(timezone.utc)
+
+    return {
+        'event_start_datetime': utc_dt,
+        'event_timezone': event_timezone
+    }
+```
+
+#### 12.1.3 Unique Constraints & Race Conditions
+
+**Problem:** Multiple acceptance attempts can cause duplicate participants or over-subscription.
+
+**Solution:**
+
+```sql
+-- UPDATED contract_participants table
+CREATE TABLE IF NOT EXISTS contract_participants (
+    -- ... other fields ...
+
+    contract_id INT NOT NULL,
+    user_id INT NOT NULL,
+    acceptance_attempt_id VARCHAR(36) COMMENT 'UUID for idempotency',
+
+    -- UNIQUE constraint prevents duplicate accepts
+    UNIQUE KEY uk_contract_user_attempt (contract_id, user_id, acceptance_attempt_id),
+
+    -- Composite unique for basic duplicate prevention
+    UNIQUE KEY uk_contract_user (contract_id, user_id),
+
+    -- Index for slot counting queries
+    INDEX idx_status_counting (contract_id, status, created_at)
+) ENGINE=InnoDB;
+
+-- Add version field to contracts for optimistic locking
+ALTER TABLE contracts ADD COLUMN (
+    version INT DEFAULT 1 NOT NULL,
+    filled_slots INT DEFAULT 0,
+
+    -- Constraint: filled_slots cannot exceed total_slots
+    CONSTRAINT chk_slots CHECK (filled_slots <= total_slots)
+);
+```
+
+**Application-level atomic slot reservation:**
+```python
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
+
+def accept_contract_atomic(contract_id, user_id, attempt_id):
+    """
+    Atomic slot reservation with optimistic locking
+    """
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            # Use SELECT FOR UPDATE to lock row
+            contract = db.session.query(Contract).with_for_update()\
+                .filter_by(id=contract_id)\
+                .one()
+
+            # Validate slots available
+            if contract.filled_slots >= contract.total_slots:
+                raise SlotsFilledException("No slots available")
+
+            # Create participant with idempotency key
+            participant = ContractParticipant(
+                contract_id=contract_id,
+                user_id=user_id,
+                acceptance_attempt_id=attempt_id,  # UUID from client
+                status='accepted',
+                accepted_at=datetime.utcnow()
+            )
+            db.session.add(participant)
+
+            # Increment filled_slots with optimistic lock check
+            contract.filled_slots += 1
+            contract.version += 1
+
+            # Commit transaction
+            db.session.commit()
+
+            return participant
+
+        except IntegrityError as e:
+            # Duplicate attempt (idempotency - return existing)
+            db.session.rollback()
+            existing = db.session.query(ContractParticipant)\
+                .filter_by(
+                    contract_id=contract_id,
+                    user_id=user_id
+                ).first()
+            if existing:
+                return existing
+            raise
+
+        except StaleDataError:
+            # Optimistic lock failed, retry
+            db.session.rollback()
+            if attempt == max_retries - 1:
+                raise ConcurrencyException("Too many concurrent accepts, retry")
+            continue
+```
+
+### 12.2 State Machine & Consistency
+
+#### 12.2.1 Contract Status State Machine
+
+**Defined States & Transitions:**
+
+```python
+from enum import Enum
+
+class ContractStatus(Enum):
+    DRAFT = 'draft'
+    ACTIVE = 'active'
+    PAUSED = 'paused'
+    IN_PROGRESS = 'in_progress'
+    PENDING_REVIEW = 'pending_review'
+    COMPLETED = 'completed'
+    CANCELLED = 'cancelled'
+    EXPIRED = 'expired'
+
+# Allowed transitions
+CONTRACT_TRANSITIONS = {
+    'draft': ['active', 'cancelled'],
+    'active': ['paused', 'in_progress', 'cancelled', 'expired'],
+    'paused': ['active', 'cancelled'],
+    'in_progress': ['pending_review', 'completed', 'cancelled'],
+    'pending_review': ['completed', 'cancelled'],
+    'completed': [],  # Terminal state
+    'cancelled': [],  # Terminal state
+    'expired': []     # Terminal state
+}
+
+def transition_contract_status(contract, new_status):
+    """Validate state transitions"""
+    current = contract.status
+
+    if new_status not in CONTRACT_TRANSITIONS.get(current, []):
+        raise InvalidStateTransition(
+            f"Cannot transition from {current} to {new_status}"
+        )
+
+    contract.status = new_status
+    contract.updated_at = datetime.utcnow()
+
+    # Log state change
+    log_activity(contract, f'status_changed_to_{new_status}')
+```
+
+#### 12.2.2 Filled Slots Reconciliation
+
+**Problem:** filled_slots can become inconsistent with actual participant count.
+
+**Solution: Single source of truth + scheduled reconciliation**
+
+```python
+def reconcile_contract_slots(contract_id):
+    """
+    Reconcile filled_slots with actual participant count
+    Run as scheduled job every 5 minutes
+    """
+    contract = db.session.query(Contract)\
+        .with_for_update()\
+        .filter_by(id=contract_id)\
+        .one()
+
+    # Count active participants
+    actual_count = db.session.query(ContractParticipant)\
+        .filter_by(contract_id=contract_id)\
+        .filter(ContractParticipant.status.in_([
+            'accepted', 'in_progress', 'completed', 'approved', 'paid'
+        ]))\
+        .count()
+
+    if contract.filled_slots != actual_count:
+        # Log discrepancy
+        logger.warning(
+            f"Slot mismatch for contract {contract_id}: "
+            f"filled_slots={contract.filled_slots}, "
+            f"actual_count={actual_count}"
+        )
+
+        # Reconcile
+        contract.filled_slots = actual_count
+        db.session.commit()
+
+        # Alert ops team
+        send_alert('slot_reconciliation', {
+            'contract_id': contract_id,
+            'corrected_count': actual_count
+        })
+
+# Cron job: */5 * * * * (every 5 minutes)
+```
+
+**Cancellation handling:**
+```python
+def cancel_participation(participant_id, reason):
+    """
+    Cancel participant and free up slot
+    """
+    participant = db.session.query(ContractParticipant)\
+        .filter_by(id=participant_id)\
+        .one()
+
+    contract = db.session.query(Contract)\
+        .with_for_update()\
+        .filter_by(id=participant.contract_id)\
+        .one()
+
+    # Update participant
+    participant.status = 'cancelled'
+    participant.cancellation_reason = reason
+    participant.cancelled_at = datetime.utcnow()
+
+    # Decrement slot count (if previously counted)
+    if participant.status in ['accepted', 'in_progress']:
+        contract.filled_slots = max(0, contract.filled_slots - 1)
+
+    db.session.commit()
+
+    # Notify waiting list (future feature)
+    notify_waitlist(contract)
+```
+
+### 12.3 Check-in Integrity & Anti-Fraud
+
+#### 12.3.1 GPS Spoofing Protection
+
+```python
+from typing import Dict, Optional
+
+class CheckInValidator:
+    """Multi-layer validation for check-ins"""
+
+    def validate_check_in(
+        self,
+        user_id: int,
+        coordinates: Dict[str, float],
+        device_info: Dict,
+        contract_id: int
+    ) -> Dict:
+        """
+        Comprehensive check-in validation
+        """
+        validations = []
+        risk_score = 0.0
+
+        # 1. GPS Accuracy Check
+        accuracy = device_info.get('location_accuracy_meters')
+        if accuracy is None or accuracy > 50:
+            validations.append({
+                'check': 'gps_accuracy',
+                'passed': False,
+                'message': f'GPS accuracy {accuracy}m exceeds 50m threshold'
+            })
+            risk_score += 0.3
+        else:
+            validations.append({
+                'check': 'gps_accuracy',
+                'passed': True
+            })
+
+        # 2. Mock Location Detection (Android)
+        is_mock = device_info.get('is_mock_location', False)
+        if is_mock:
+            validations.append({
+                'check': 'mock_location',
+                'passed': False,
+                'message': 'Mock location detected'
+            })
+            risk_score += 0.8  # Very suspicious
+
+        # 3. Device Fingerprint Check
+        device_id = device_info.get('device_id')
+        if device_id:
+            # Check if device has history of fraud
+            fraud_history = self.check_device_fraud_history(device_id)
+            if fraud_history['is_flagged']:
+                validations.append({
+                    'check': 'device_reputation',
+                    'passed': False,
+                    'message': 'Device flagged for suspicious activity'
+                })
+                risk_score += 0.6
+
+        # 4. Velocity Check (impossible travel speed)
+        last_checkin = self.get_last_check_in(user_id)
+        if last_checkin:
+            time_diff = (datetime.utcnow() - last_checkin.checked_in_at).total_seconds()
+            distance = calculate_distance(
+                coordinates['lat'], coordinates['lng'],
+                last_checkin.check_in_lat, last_checkin.check_in_lng
+            )
+
+            # Max speed: 1000 km/h (flight speed)
+            max_possible_distance = (time_diff / 3600) * 1000 * 1000  # meters
+
+            if distance > max_possible_distance:
+                validations.append({
+                    'check': 'velocity',
+                    'passed': False,
+                    'message': f'Impossible travel: {distance}m in {time_diff}s'
+                })
+                risk_score += 0.9  # Nearly impossible
+
+        # 5. Time-of-day pattern analysis
+        hour = datetime.utcnow().hour
+        if 2 <= hour <= 5:  # 2-5 AM UTC unusual for events
+            risk_score += 0.1
+
+        # 6. IP Address / Network Check
+        ip_address = device_info.get('ip_address')
+        if ip_address:
+            # Check if IP is VPN/proxy/datacenter
+            is_vpn = self.check_vpn_ip(ip_address)
+            if is_vpn:
+                validations.append({
+                    'check': 'network',
+                    'passed': False,
+                    'message': 'VPN/proxy detected'
+                })
+                risk_score += 0.4
+
+        # Decision logic
+        if risk_score >= 0.8:
+            decision = 'reject'
+            action = 'auto_reject_high_risk'
+        elif risk_score >= 0.5:
+            decision = 'manual_review'
+            action = 'flag_for_review'
+        else:
+            decision = 'approve'
+            action = 'auto_approve'
+
+        return {
+            'decision': decision,
+            'action': action,
+            'risk_score': risk_score,
+            'validations': validations,
+            'requires_manual_review': risk_score >= 0.5
+        }
+
+    def check_device_fraud_history(self, device_id: str) -> Dict:
+        """Check device reputation"""
+        fraud_count = db.session.query(CheckIn)\
+            .filter_by(device_id=device_id)\
+            .filter_by(status='disputed')\
+            .count()
+
+        return {
+            'is_flagged': fraud_count >= 2,
+            'fraud_count': fraud_count
+        }
+```
+
+#### 12.3.2 Clock Skew Handling
+
+```python
+def validate_check_in_timing(contract, client_timestamp):
+    """
+    Handle clock skew between client and server
+    """
+    server_time = datetime.utcnow()
+    client_time = datetime.fromisoformat(client_timestamp)
+
+    # Calculate skew
+    skew_seconds = abs((server_time - client_time).total_seconds())
+
+    # Allow up to 5 minutes of clock skew
+    MAX_SKEW_SECONDS = 300
+
+    if skew_seconds > MAX_SKEW_SECONDS:
+        raise ClockSkewException(
+            f"Client clock skew {skew_seconds}s exceeds {MAX_SKEW_SECONDS}s. "
+            f"Server: {server_time}, Client: {client_time}"
+        )
+
+    # Use server time as authoritative
+    return server_time
+```
+
+#### 12.3.3 Retry & Backoff Rules
+
+```python
+# Client-side retry configuration
+CHECK_IN_RETRY_CONFIG = {
+    'max_attempts': 3,
+    'backoff_multiplier': 2,
+    'initial_delay_ms': 1000,
+    'max_delay_ms': 10000,
+    'retryable_errors': [408, 429, 500, 502, 503, 504]
+}
+
+# Server-side idempotency
+@app.post("/api/check-ins")
+def create_check_in(
+    request: CheckInRequest,
+    idempotency_key: str = Header(None, alias="Idempotency-Key")
+):
+    """
+    Check-in endpoint with idempotency support
+    """
+    if not idempotency_key:
+        raise ValidationError("Idempotency-Key header required")
+
+    # Check for existing request with same key (24h TTL)
+    existing = redis_client.get(f"checkin:idem:{idempotency_key}")
+    if existing:
+        # Return cached response
+        return json.loads(existing)
+
+    # Process check-in
+    result = process_check_in(request)
+
+    # Cache result for 24 hours
+    redis_client.setex(
+        f"checkin:idem:{idempotency_key}",
+        86400,  # 24 hours
+        json.dumps(result)
+    )
+
+    return result
+```
+
+### 12.4 Payment State Machine & Idempotency
+
+#### 12.4.1 Complete Payment States
+
+```sql
+-- Add comprehensive payment tracking
+ALTER TABLE contract_participants ADD COLUMN (
+    -- Payment lifecycle
+    payment_status ENUM(
+        'not_started',      -- Initial state
+        'escrow_pending',   -- Awaiting escrow funding
+        'escrow_funded',    -- Brand funded escrow
+        'escrow_held',      -- Funds held pending completion
+        'payout_pending',   -- Completion approved, payout queued
+        'payout_processing',-- Payment processor working
+        'payout_completed', -- Successfully paid
+        'payout_failed',    -- Payment failed (retryable)
+        'disputed',         -- Dispute raised
+        'refund_pending',   -- Refund requested
+        'refund_completed', -- Refunded to brand
+        'cancelled'         -- Payment cancelled
+    ) DEFAULT 'not_started',
+
+    -- Idempotency
+    payment_idempotency_key VARCHAR(64) UNIQUE COMMENT 'Prevent duplicate payouts',
+    escrow_idempotency_key VARCHAR(64) UNIQUE COMMENT 'Prevent duplicate escrow',
+
+    -- Tracking
+    escrow_transaction_id VARCHAR(255),
+    escrow_amount DECIMAL(10,2),
+    escrow_funded_at DATETIME,
+
+    payout_transaction_id VARCHAR(255),
+    payout_amount DECIMAL(10,2),
+    payout_initiated_at DATETIME,
+    payout_completed_at DATETIME,
+    payout_failed_at DATETIME,
+    payout_failure_reason TEXT,
+    payout_retry_count INT DEFAULT 0,
+
+    refund_transaction_id VARCHAR(255),
+    refund_amount DECIMAL(10,2),
+    refund_completed_at DATETIME
+);
+```
+
+#### 12.4.2 Payment Workflow
+
+**Public Contracts - Pre-fund Strategy:**
+```python
+def accept_public_contract(contract_id, user_id):
+    """
+    For public contracts: charge brand on acceptance
+    """
+    participant = create_participant_atomic(contract_id, user_id)
+
+    # Generate idempotency key
+    escrow_key = f"escrow:{contract_id}:{user_id}:{uuid.uuid4()}"
+
+    # Charge brand and hold in escrow
+    try:
+        escrow_result = payment_service.create_escrow(
+            idempotency_key=escrow_key,
+            from_company_id=contract.company_id,
+            amount=contract.payout_amount,
+            currency=contract.payout_currency,
+            metadata={
+                'contract_id': contract_id,
+                'participant_id': participant.id,
+                'type': 'contract_escrow'
+            }
+        )
+
+        participant.payment_status = 'escrow_funded'
+        participant.escrow_idempotency_key = escrow_key
+        participant.escrow_transaction_id = escrow_result.transaction_id
+        participant.escrow_amount = escrow_result.amount
+        participant.escrow_funded_at = datetime.utcnow()
+
+        db.session.commit()
+
+    except PaymentException as e:
+        # Revert participant acceptance
+        participant.status = 'payment_failed'
+        participant.payment_failure_reason = str(e)
+        db.session.commit()
+
+        # Free up slot
+        reconcile_contract_slots(contract_id)
+
+        raise AcceptanceFailedException(
+            "Unable to process payment. Please try again."
+        )
+
+    return participant
+```
+
+**Payout Processing with Idempotency:**
+```python
+async def process_payout_idempotent(participant_id):
+    """
+    Process payout with full idempotency guarantees
+    """
+    participant = db.session.query(ContractParticipant)\
+        .with_for_update()\
+        .filter_by(id=participant_id)\
+        .one()
+
+    # Check if already processed
+    if participant.payment_status == 'payout_completed':
+        return {
+            'status': 'already_processed',
+            'transaction_id': participant.payout_transaction_id
+        }
+
+    # Generate idempotency key (deterministic)
+    payout_key = f"payout:{participant.id}:{participant.contract_id}"
+
+    # Check for in-flight request
+    if participant.payment_idempotency_key == payout_key:
+        # Already processing
+        return {
+            'status': 'processing',
+            'message': 'Payout already in progress'
+        }
+
+    try:
+        # Update status
+        participant.payment_status = 'payout_processing'
+        participant.payment_idempotency_key = payout_key
+        participant.payout_initiated_at = datetime.utcnow()
+        db.session.commit()
+
+        # Call payment service with idempotency key
+        payout_result = await payment_service.create_payout(
+            idempotency_key=payout_key,
+            to_user_id=participant.user_id,
+            amount=participant.contract.payout_amount,
+            currency=participant.contract.payout_currency,
+            source_transaction_id=participant.escrow_transaction_id,
+            metadata={
+                'contract_id': participant.contract_id,
+                'participant_id': participant.id
+            }
+        )
+
+        # Success - update record
+        participant.payment_status = 'payout_completed'
+        participant.payout_transaction_id = payout_result.transaction_id
+        participant.payout_amount = payout_result.amount
+        participant.payout_completed_at = datetime.utcnow()
+        participant.status = 'paid'
+        db.session.commit()
+
+        # Send notification
+        notify_user_payment_completed(participant)
+
+        return payout_result
+
+    except PaymentProcessingException as e:
+        # Retryable error
+        participant.payment_status = 'payout_failed'
+        participant.payout_failed_at = datetime.utcnow()
+        participant.payout_failure_reason = str(e)
+        participant.payout_retry_count += 1
+        db.session.commit()
+
+        # Schedule retry (exponential backoff)
+        if participant.payout_retry_count < 5:
+            delay = 2 ** participant.payout_retry_count * 60  # 2, 4, 8, 16, 32 min
+            schedule_payout_retry(participant.id, delay_seconds=delay)
+        else:
+            # Max retries exceeded, alert ops
+            alert_payout_failed(participant)
+
+        raise
+```
+
+**Webhook Idempotency:**
+```python
+@app.post("/webhooks/payment")
+def payment_webhook(
+    event: PaymentWebhookEvent,
+    idempotency_key: str = Header(..., alias="X-Idempotency-Key")
+):
+    """
+    Handle payment webhooks with idempotency
+    """
+    # Check if already processed
+    processed = redis_client.get(f"webhook:processed:{idempotency_key}")
+    if processed:
+        return {"status": "already_processed"}
+
+    # Acquire distributed lock
+    lock_key = f"webhook:lock:{idempotency_key}"
+    lock = redis_client.lock(lock_key, timeout=30)
+
+    if not lock.acquire(blocking=False):
+        # Another instance is processing
+        return {"status": "processing"}
+
+    try:
+        # Process webhook
+        result = process_payment_webhook(event)
+
+        # Mark as processed (TTL 7 days)
+        redis_client.setex(
+            f"webhook:processed:{idempotency_key}",
+            604800,  # 7 days
+            json.dumps(result)
+        )
+
+        return result
+
+    finally:
+        lock.release()
+```
+
+### 12.5 Privacy & Compliance
+
+#### 12.5.1 GPS Data Retention Policy
+
+```sql
+-- Add retention tracking
+ALTER TABLE check_ins ADD COLUMN (
+    gps_data_retention_until DATETIME COMMENT 'When to anonymize GPS',
+    anonymized BOOLEAN DEFAULT FALSE,
+    anonymized_at DATETIME NULL
+);
+
+-- Retention policy: 90 days for dispute resolution, then anonymize
+CREATE EVENT anonymize_old_gps_data
+ON SCHEDULE EVERY 1 DAY
+DO
+  UPDATE check_ins
+  SET check_in_lat = 0,
+      check_in_lng = 0,
+      check_in_point = ST_GeomFromText('POINT(0 0)', 4326),
+      anonymized = TRUE,
+      anonymized_at = NOW()
+  WHERE checked_in_at < DATE_SUB(NOW(), INTERVAL 90 DAY)
+    AND anonymized = FALSE
+    AND status NOT IN ('disputed');
+```
+
+```python
+def create_check_in(data):
+    """Set retention timestamp on creation"""
+    check_in = CheckIn(**data)
+
+    # GPS data expires after 90 days
+    check_in.gps_data_retention_until = datetime.utcnow() + timedelta(days=90)
+
+    db.session.add(check_in)
+    db.session.commit()
+```
+
+#### 12.5.2 Activity Log Retention
+
+```python
+# Retention policies
+RETENTION_POLICIES = {
+    'activity_log': 365,     # 1 year
+    'check_in_photos': 90,   # 90 days
+    'gps_coordinates': 90,   # 90 days
+    'device_fingerprints': 180,  # 6 months
+    'ip_addresses': 90       # 90 days (GDPR requirement)
+}
+
+# Scheduled job to purge old data
+def purge_expired_data():
+    """Daily cleanup job"""
+    cutoff_date = datetime.utcnow() - timedelta(days=365)
+
+    # Delete old activity logs
+    db.session.query(ContractActivityLog)\
+        .filter(ContractActivityLog.created_at < cutoff_date)\
+        .delete()
+
+    # Anonymize IP addresses
+    ip_cutoff = datetime.utcnow() - timedelta(days=90)
+    db.session.query(CheckIn)\
+        .filter(CheckIn.checked_in_at < ip_cutoff)\
+        .update({'ip_address': '0.0.0.0'})
+
+    db.session.commit()
+```
+
+#### 12.5.3 Public Profile Query Protection
+
+```sql
+-- Prevent aggregation attacks to deduce earnings
+CREATE VIEW user_public_stats AS
+SELECT
+    user_id,
+    COUNT(DISTINCT cp.contract_id) as total_contracts,
+    AVG(cp.performance_rating) as avg_rating,
+    COUNT(CASE WHEN cp.status = 'paid' THEN 1 END) /
+        NULLIF(COUNT(*), 0) as completion_rate,
+    -- NO earnings data
+    -- NO contract details
+    -- NO brand names
+    NULL as total_earnings,  -- Always NULL
+    NULL as contracts_list   -- Always NULL
+FROM contract_participants cp
+WHERE cp.status IN ('completed', 'approved', 'paid')
+GROUP BY user_id;
+
+-- Query is safe - cannot reverse-engineer earnings
+```
+
+```python
+def get_public_profile(user_id, requesting_user_id):
+    """
+    Public profile with privacy controls
+    """
+    # Prevent own profile exposure
+    if user_id == requesting_user_id:
+        raise PermissionDenied("Use private stats endpoint for own profile")
+
+    # Get sanitized stats
+    stats = db.session.query(UserPublicStats)\
+        .filter_by(user_id=user_id)\
+        .first()
+
+    return {
+        'user_id': user_id,
+        'total_completed_contracts': stats.total_contracts,
+        'avg_rating': round(stats.avg_rating, 1),  # Round to 1 decimal
+        'completion_rate': round(stats.completion_rate, 2),
+        # NEVER include:
+        # - total_earnings
+        # - contract titles
+        # - brand names
+        # - specific dates
+        # - payout amounts
+    }
+```
+
+### 12.6 Observability & SLOs
+
+#### 12.6.1 Key Metrics & Alerts
+
+```python
+# Prometheus metrics
+from prometheus_client import Counter, Histogram, Gauge
+
+# Check-in metrics
+checkin_attempts = Counter(
+    'checkin_attempts_total',
+    'Total check-in attempts',
+    ['status', 'contract_type']
+)
+
+checkin_geofence_failures = Counter(
+    'checkin_geofence_failures_total',
+    'Check-ins rejected for geofence violation',
+    ['reason']
+)
+
+checkin_fraud_score = Histogram(
+    'checkin_fraud_score',
+    'Distribution of fraud risk scores',
+    buckets=[0, 0.2, 0.4, 0.6, 0.8, 1.0]
+)
+
+# Slot contention
+slot_acceptance_duration = Histogram(
+    'slot_acceptance_duration_seconds',
+    'Time to accept contract slot',
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0]
+)
+
+slot_contention_retries = Counter(
+    'slot_contention_retries_total',
+    'Optimistic lock retry attempts'
+)
+
+# Payment metrics
+payment_payout_status = Counter(
+    'payment_payout_status_total',
+    'Payout outcomes',
+    ['status']  # completed, failed, retrying
+)
+
+payment_webhook_latency = Histogram(
+    'payment_webhook_latency_seconds',
+    'Webhook processing time',
+    buckets=[0.1, 0.5, 1.0, 5.0, 10.0, 30.0]
+)
+
+payment_failures = Counter(
+    'payment_failures_total',
+    'Payment failures',
+    ['reason', 'retryable']
+)
+```
+
+#### 12.6.2 Service Level Objectives (SLOs)
+
+```yaml
+# SLO definitions
+slos:
+  check_in_success_rate:
+    target: 99.5%
+    description: "Check-ins succeed when user is within geofence"
+    measurement: checkin_attempts{status='success'} / checkin_attempts_total
+    alert_threshold: 99.0%
+
+  geofence_validation_accuracy:
+    target: 99.9%
+    description: "Geofence calculations are accurate"
+    measurement: Manual audit of disputed check-ins
+    alert_threshold: 99.5%
+
+  slot_acceptance_latency:
+    target: p95 < 1s
+    description: "Slot acceptance completes within 1 second (95th percentile)"
+    measurement: slot_acceptance_duration_seconds
+    alert_threshold: p95 > 2s
+
+  payment_success_rate:
+    target: 99.9%
+    description: "Payouts complete successfully"
+    measurement: payment_payout_status{status='completed'} / payment_payout_status_total
+    alert_threshold: 99.5%
+
+  webhook_processing_time:
+    target: p99 < 5s
+    description: "Payment webhooks processed within 5 seconds"
+    measurement: payment_webhook_latency_seconds
+    alert_threshold: p99 > 10s
+```
+
+#### 12.6.3 Dashboards
+
+```python
+# Grafana dashboard configuration
+GRAFANA_DASHBOARDS = {
+    'contract_workflow_overview': {
+        'panels': [
+            {
+                'title': 'Check-in Success Rate (24h)',
+                'query': 'rate(checkin_attempts{status="success"}[24h]) / rate(checkin_attempts_total[24h])',
+                'target': 0.995
+            },
+            {
+                'title': 'Geofence Failures by Reason',
+                'query': 'sum by (reason) (rate(checkin_geofence_failures_total[1h]))',
+                'type': 'pie_chart'
+            },
+            {
+                'title': 'Slot Contention Errors',
+                'query': 'rate(slot_contention_retries_total[5m])',
+                'alert': 'value > 10'
+            },
+            {
+                'title': 'Payment Processing Status',
+                'query': 'sum by (status) (rate(payment_payout_status_total[1h]))',
+                'type': 'stacked_bar'
+            },
+            {
+                'title': 'Webhook Latency p95',
+                'query': 'histogram_quantile(0.95, payment_webhook_latency_seconds)',
+                'target': 5.0
+            }
+        ]
+    },
+
+    'fraud_detection': {
+        'panels': [
+            {
+                'title': 'Fraud Risk Score Distribution',
+                'query': 'histogram_quantile(0.50, checkin_fraud_score)',
+            },
+            {
+                'title': 'Mock Location Detections',
+                'query': 'sum(rate(checkin_geofence_failures{reason="mock_location"}[1h]))'
+            },
+            {
+                'title': 'Velocity Check Failures',
+                'query': 'sum(rate(checkin_geofence_failures{reason="velocity"}[1h]))'
+            }
+        ]
+    }
+}
+```
+
+### 12.7 API Hardening
+
+#### 12.7.1 Rate Limiting
+
+```python
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    storage_uri="redis://localhost:6379",
+    strategy="fixed-window"
+)
+
+# Endpoint-specific rate limits
+RATE_LIMITS = {
+    'contract_create': "10 per hour",      # Prevent spam contracts
+    'contract_accept': "20 per minute",    # Allow browsing but limit accepts
+    'check_in_create': "5 per minute",     # Prevent check-in spam
+    'check_in_validate': "30 per minute",  # Allow location checks
+    'payment_webhook': "1000 per minute",  # High throughput for webhooks
+    'public_search': "100 per minute",     # Generous for discovery
+    'private_dashboard': "300 per minute"  # High limit for own data
+}
+
+@app.post("/api/contracts")
+@limiter.limit(RATE_LIMITS['contract_create'])
+def create_contract():
+    pass
+
+@app.post("/api/contracts/<id>/accept")
+@limiter.limit(RATE_LIMITS['contract_accept'])
+def accept_contract(id):
+    pass
+
+@app.post("/api/check-ins")
+@limiter.limit(RATE_LIMITS['check_in_create'])
+def create_check_in():
+    pass
+```
+
+#### 12.7.2 Pagination Standards
+
+```python
+# Global pagination defaults
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
+
+def paginate_query(query, page=1, per_page=DEFAULT_PAGE_SIZE):
+    """Standard pagination"""
+    per_page = min(per_page, MAX_PAGE_SIZE)  # Enforce maximum
+
+    pagination = query.paginate(
+        page=page,
+        per_page=per_page,
+        error_out=False
+    )
+
+    return {
+        'items': [item.to_dict() for item in pagination.items],
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total_items': pagination.total,
+            'total_pages': pagination.pages,
+            'has_next': pagination.has_next,
+            'has_prev': pagination.has_prev,
+            'next_page': page + 1 if pagination.has_next else None,
+            'prev_page': page - 1 if pagination.has_prev else None
+        }
+    }
+
+@app.get("/api/contracts")
+def list_contracts(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100)
+):
+    query = db.session.query(Contract).filter_by(status='active')
+    return paginate_query(query, page, per_page)
+```
+
+#### 12.7.3 Error Codes & Response Standards
+
+```python
+# Standardized error codes
+ERROR_CODES = {
+    # Authentication & Authorization (1xxx)
+    1001: "UNAUTHORIZED",
+    1002: "FORBIDDEN_RESOURCE",
+    1003: "INVALID_TOKEN",
+    1004: "TOKEN_EXPIRED",
+
+    # Validation Errors (2xxx)
+    2001: "INVALID_INPUT",
+    2002: "MISSING_REQUIRED_FIELD",
+    2003: "INVALID_COORDINATES",
+    2004: "INVALID_DATE_RANGE",
+
+    # Business Logic Errors (3xxx)
+    3001: "SLOTS_FILLED",
+    3002: "ALREADY_ACCEPTED",
+    3003: "CONTRACT_EXPIRED",
+    3004: "OUTSIDE_GEOFENCE",
+    3005: "OUTSIDE_TIME_WINDOW",
+    3006: "INSUFFICIENT_DURATION",
+    3007: "MOCK_LOCATION_DETECTED",
+    3008: "HIGH_FRAUD_RISK",
+
+    # Payment Errors (4xxx)
+    4001: "PAYMENT_FAILED",
+    4002: "INSUFFICIENT_FUNDS",
+    4003: "PAYOUT_PENDING",
+    4004: "ALREADY_PAID",
+
+    # System Errors (5xxx)
+    5001: "DATABASE_ERROR",
+    5002: "EXTERNAL_SERVICE_ERROR",
+    5003: "RATE_LIMIT_EXCEEDED",
+    5004: "CONCURRENCY_ERROR"
+}
+
+class APIError(Exception):
+    def __init__(self, code, message, details=None, http_status=400):
+        self.code = code
+        self.message = message
+        self.details = details or {}
+        self.http_status = http_status
+
+@app.errorhandler(APIError)
+def handle_api_error(error):
+    return jsonify({
+        'error': {
+            'code': error.code,
+            'error_code': ERROR_CODES.get(error.code, "UNKNOWN_ERROR"),
+            'message': error.message,
+            'details': error.details
+        }
+    }), error.http_status
+
+# Usage
+@app.post("/api/contracts/<id>/accept")
+def accept_contract(id):
+    if contract.filled_slots >= contract.total_slots:
+        raise APIError(
+            code=3001,
+            message="All slots for this contract are filled",
+            details={'contract_id': id, 'total_slots': contract.total_slots},
+            http_status=409
+        )
+```
+
+#### 12.7.4 Authentication & Authorization Matrix
+
+```python
+# Role-based access control per endpoint
+AUTHORIZATION_MATRIX = {
+    # Contract Management
+    'POST /api/contracts': ['brand', 'admin'],
+    'GET /api/contracts/:id': ['any'],  # Public info
+    'PUT /api/contracts/:id': ['brand:owner', 'admin'],
+    'DELETE /api/contracts/:id': ['brand:owner', 'admin'],
+
+    # Participation
+    'POST /api/contracts/:id/accept': ['athlete', 'influencer'],
+    'GET /api/users/:user_id/contracts': ['user:self', 'admin'],
+
+    # Check-ins
+    'POST /api/check-ins': ['athlete', 'influencer'],
+    'GET /api/check-ins/:id': ['user:owner', 'brand:contract_owner', 'admin'],
+
+    # Approval
+    'PUT /api/contract-participants/:id/approve': ['brand:contract_owner', 'admin'],
+
+    # Payments
+    'POST /api/payments/process': ['system', 'admin'],
+    'GET /api/contract-participants/:id/payment': ['user:owner', 'brand:contract_owner', 'admin'],
+
+    # Analytics
+    'GET /api/users/:user_id/stats': ['user:self', 'admin'],  # Private
+    'GET /api/users/:user_id/public-stats': ['any'],          # Public
+}
+
+def check_authorization(endpoint, user, resource=None):
+    """
+    Check if user is authorized for endpoint
+    """
+    required_roles = AUTHORIZATION_MATRIX.get(endpoint, [])
+
+    for role_spec in required_roles:
+        if ':' in role_spec:
+            # Conditional role (e.g., 'user:self', 'brand:owner')
+            role, condition = role_spec.split(':')
+
+            if user.role != role:
+                continue
+
+            if condition == 'self' and resource.user_id == user.id:
+                return True
+            elif condition == 'owner' and resource.created_by_user_id == user.id:
+                return True
+            elif condition == 'contract_owner' and resource.contract.company_id == user.company_id:
+                return True
+        else:
+            # Simple role check
+            if role_spec == 'any' or user.role == role_spec:
+                return True
+
+    raise APIError(
+        code=1002,
+        message="You do not have permission to access this resource",
+        http_status=403
+    )
+```
+
+## 13. Conclusion
 
 This contract workflow system enables the core value proposition of NILBx: connecting brands with athletes/influencers for location-based promotional opportunities. The geo-fencing via check-in service ensures accountability, while the privacy-focused UI/UX protects user earnings and relationships. The system balances brand control (approval workflows) with user autonomy (public marketplace), creating a win-win platform for all parties.
 
+**Production Readiness Checklist:**
+- ✅ Geospatial indexing with MySQL POINT types
+- ✅ Timezone-aware datetime handling (UTC storage, local display)
+- ✅ Race condition protection with optimistic locking
+- ✅ Complete state machines for contracts and payments
+- ✅ GPS spoofing detection (6-layer validation)
+- ✅ Payment idempotency (escrow, payout, webhooks)
+- ✅ Data retention and privacy compliance (GDPR-ready)
+- ✅ Comprehensive observability (metrics, SLOs, dashboards)
+- ✅ API hardening (rate limits, pagination, error codes, RBAC)
+
 **Next Steps:**
-1. Review and approve this plan
-2. Create database migrations
-3. Begin API implementation
-4. Parallel frontend development
-5. Beta testing with real users
+1. Review and approve this hardened plan
+2. Create database migrations with production schema
+3. Implement API with full error handling
+4. Set up monitoring and alerting
+5. Security audit and penetration testing
+6. Load testing (slot contention, concurrent check-ins)
+7. Beta testing with real users
