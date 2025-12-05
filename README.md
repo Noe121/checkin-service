@@ -1,6 +1,6 @@
 # Check-in Service
 
-A FastAPI-based microservice for geo-fencing and social verification check-ins in the NILbx platform. This service enables athletes to check into sponsored deals at physical locations with GPS verification and social media proof-of-visit.
+A FastAPI-based microservice for geo-fencing and social verification check-ins in the NILbx platform. This service enables users to check into sponsored deals at physical locations with GPS verification and social media proof-of-visit.
 
 ## 🚀 Features
 
