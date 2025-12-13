@@ -358,15 +358,15 @@ checkin-service/
 - **MySQL Database**: Shared `nilbx_db` with other services
 - **Feature Flag Service**: Dynamic configuration management
 - **Payment Service**: Automatic payout processing
-- **API Gateway**: Request routing and authentication
+- **ALB**: Request routing and authentication (fronted by CloudFront)
 
-### API Gateway Configuration
+### ALB / Edge Configuration
 
-The service is configured behind an API Gateway with:
-- **Base Path**: `/checkin`
+The service is configured behind the ALB (via CloudFront) with:
+- **Path**: `/checkin`
 - **Authentication**: JWT token validation
-- **Rate Limiting**: 1000 requests/minute burst
-- **CORS**: Cross-origin request support
+- **Rate Limiting**: Handled at ALB/WAF layer
+- **CORS**: Single layer (ALB)
 
 ## 📊 Monitoring
 
