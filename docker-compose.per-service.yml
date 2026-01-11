@@ -1,42 +1,41 @@
+version: '3.8'
+
 services:
-  # Admin Dashboard Database
-  admin-db:
-    image: mysql:8.0
-    container_name: admin-db
+  checkin-db:
+    image: mysql:8.4
+    container_name: checkin-db
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: admin_db
-      MYSQL_USER: adminuser
-      MYSQL_PASSWORD: adminpass
+      MYSQL_DATABASE: checkin_db
+      MYSQL_USER: checkin_user
+      MYSQL_PASSWORD: checkin_pass
     ports:
-      - "3322:3306"
+      - "3307:3306"
     volumes:
-      - admin_db_data:/var/lib/mysql
-      - ./migrations/001_initial_schema_enhanced.sql:/docker-entrypoint-initdb.d/01-schema.sql
-    command: --default-authentication-plugin=mysql_native_password
+      - checkin_db_data:/var/lib/mysql
+      - ./migrations/0001_init_checkin_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
     networks:
-      - admin-network
+      - checkin-network
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       timeout: 20s
       retries: 10
 
-  # Admin Dashboard Service
-  admin-dashboard-service:
+  checkin-service:
     build: .
-    container_name: admin-dashboard-service
+    container_name: checkin-service
     restart: unless-stopped
     depends_on:
-      admin-db:
+      checkin-db:
         condition: service_healthy
     environment:
-      DB_HOST: admin-db
+      DB_HOST: checkin-db
       DB_PORT: 3306
-      DB_NAME: admin_db
-      DB_USER: adminuser
-      DB_PASSWORD: adminpass
-      AUTH_SERVICE_URL: http://host.docker.internal:9000
+      DB_NAME: checkin_db
+      DB_USER: checkin_user
+      DB_PASSWORD: checkin_pass
+      FEATURE_FLAG_URL: http://feature-flag-service:8083
       API_MODE: per-service
       SCHEMA_MODE: per-service
     ports:
@@ -45,7 +44,7 @@ services:
       - .:/app
       - /app/__pycache__
     networks:
-      - admin-network
+      - checkin-network
     command: bash -c "uvicorn main:app --host 0.0.0.0 --port 8006 --reload"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
@@ -55,8 +54,8 @@ services:
       start_period: 40s
 
 volumes:
-  admin_db_data:
+  checkin_db_data:
 
 networks:
-  admin-network:
+  checkin-network:
     driver: bridge
