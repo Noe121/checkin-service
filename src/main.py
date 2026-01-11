@@ -23,14 +23,34 @@ logging.basicConfig(
 logger = logging.getLogger("checkin-service")
 logger.info("Check-in service starting up")
 
-# Database configuration
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "rootpassword"),
-    "database": os.getenv("DB_NAME", "nilbx_db")
-}
+# Database configuration - Load from Secrets Manager
+SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-checkin-db-credentials")
+
+def _get_db_config():
+    """Load database config from Secrets Manager."""
+    try:
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+        from shared.secrets_manager import get_db_credentials
+        creds = get_db_credentials(SECRET_NAME)
+        logger.info("✓ Loaded checkin database credentials from AWS Secrets Manager")
+        return {
+            "host": creds['host'],
+            "port": creds['port'],
+            "user": creds['username'],
+            "password": creds['password'],
+            "database": creds['dbname']
+        }
+    except Exception as e:
+        logger.warning(f"Could not load from Secrets Manager: {e}. Using environment variables.")
+        return {
+            "host": os.getenv("DB_HOST", "localhost"),
+            "port": int(os.getenv("DB_PORT", 3306)),
+            "user": os.getenv("DB_USER", "root"),
+            "password": os.getenv("DB_PASSWORD", "rootpassword"),
+            "database": os.getenv("DB_NAME", "nilbx_db")
+        }
+
+DB_CONFIG = _get_db_config()
 
 # ===== FastAPI Setup =====
 
