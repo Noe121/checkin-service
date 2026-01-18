@@ -30,7 +30,7 @@ services:
       - MYSQL_USER=checkin_user
       - MYSQL_PASSWORD=checkin_pass
     ports:
-      - "3307:3306"
+      - "3322:3306"
     volumes:
       - checkin_mysql_data:/var/lib/mysql
       - ./migrations/0001_init_checkin_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
