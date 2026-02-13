@@ -23,6 +23,16 @@ logging.basicConfig(
 logger = logging.getLogger("checkin-service")
 logger.info("Check-in service starting up")
 
+# NIL Platform Middleware
+try:
+    from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+except ImportError:
+    from pathlib import Path
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+
 # Database configuration - Load from Secrets Manager
 SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-checkin-db-credentials")
 
@@ -59,6 +69,11 @@ app = FastAPI(
     description="Handles event check-ins and attendance tracking",
     version="1.0.0"
 )
+
+# NIL Platform Middleware
+app.add_middleware(CorrelationMiddleware)
+if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
+    app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
 
 def get_db():

@@ -8,7 +8,7 @@ services:
     environment:
       - DB_HOST=checkin-mysql
       - DB_PORT=3306
-      - DB_NAME=checkin_db
+      - DB_NAME=notifications_db
       - DB_USER=checkin_user
       - DB_PASSWORD=checkin_pass
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
@@ -26,14 +26,14 @@ services:
     restart: always
     environment:
       - MYSQL_ROOT_PASSWORD=rootpassword
-      - MYSQL_DATABASE=checkin_db
+      - MYSQL_DATABASE=notifications_db
       - MYSQL_USER=checkin_user
       - MYSQL_PASSWORD=checkin_pass
     ports:
       - "3322:3306"
     volumes:
       - checkin_mysql_data:/var/lib/mysql
-      - ./migrations/0001_init_checkin_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ../NILbx-env/modules/db/mysql/migrations/notifications_db:/docker-entrypoint-initdb.d:ro
     networks:
       - checkin-network
     healthcheck:
