@@ -6,35 +6,41 @@ services:
     ports:
       - "8006:8006"
     environment:
-      - DB_HOST=mysql-nilbx
+      - DB_HOST=checkin-mysql
       - DB_PORT=3306
-      - DB_NAME=nilbx_db
-      - DB_USER=root
-      - DB_PASSWORD=rootpassword
+      - DB_NAME=notifications_db
+      - DB_USER=checkin_user
+      - DB_PASSWORD=checkin_pass
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - TWITTER_API_KEY=${TWITTER_API_KEY}
       - FEATURE_FLAG_URL=http://feature-flag-service:8083
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     networks:
       - checkin-network
 
   mysql:
-    image: mysql:8.0
+    image: mysql:8.4
     container_name: checkin-mysql
     restart: always
     environment:
       - MYSQL_ROOT_PASSWORD=rootpassword
-      - MYSQL_DATABASE=nilbx_db
+      - MYSQL_DATABASE=notifications_db
       - MYSQL_USER=checkin_user
       - MYSQL_PASSWORD=checkin_pass
     ports:
-      - "3307:3306"
+      - "3322:3306"
     volumes:
       - checkin_mysql_data:/var/lib/mysql
-      - ./init_checkin_db.sql:/docker-entrypoint-initdb.d/init.sql
+      - ../NILbx-env/modules/db/mysql/migrations/notifications_db:/docker-entrypoint-initdb.d:ro
     networks:
       - checkin-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   checkin_mysql_data:

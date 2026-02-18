@@ -10,7 +10,7 @@ A FastAPI-based microservice for geo-fencing and social verification check-ins i
 - **Hotspot Management**: Dynamic geo-fence creation and management
 - **Feature Flags**: Configurable feature toggles via external service
 - **Health Monitoring**: Comprehensive health checks and metrics
-- **Database Integration**: MySQL integration with the main NILbx database
+- **Database Integration**: MySQL 8.4 with service-owned `checkin_db` (no cross-service FKs)
 
 ## 🏗️ Architecture
 
@@ -185,42 +185,30 @@ CREATE TABLE geo_fences (
 
 ### Prerequisites
 - Python 3.11+
-- MySQL 8.0+
+- MySQL 8.4+
 - Docker & Docker Compose (for containerized setup)
 
-### Local Development Setup
+### Local Development Setup (service-isolated DB)
 
 1. **Clone and navigate:**
    ```bash
    cd checkin-service
    ```
 
-2. **Create virtual environment:**
+2. **Run via Docker Compose (recommended):**
+   ```bash
+   docker-compose -f docker-compose.per-service.yml up --build
+   ```
+   - MySQL 8.4 starts with `checkin_db` on host port `3307`, seeded by `migrations/0001_init_checkin_schema.sql`.
+   - Service starts on `http://localhost:8006` after DB health passes.
+   - Health check: `curl http://localhost:8006/health`
+
+3. **Manual venv (optional):**
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
    pip install -r requirements.txt
-   ```
-
-4. **Set up environment variables:**
-   ```bash
-   export DB_HOST=localhost
-   export DB_PORT=3306
-   export DB_NAME=nilbx_db
-   export DB_USER=root
-   export DB_PASSWORD=rootpassword
-   export GOOGLE_MAPS_API_KEY=your_api_key
-   export TWITTER_API_KEY=your_api_key
-   export FEATURE_FLAG_URL=http://localhost:8004
-   ```
-
-5. **Run the service:**
-   ```bash
-   cd src
+   export DB_HOST=localhost DB_PORT=3307 DB_NAME=checkin_db DB_USER=checkin_user DB_PASSWORD=checkin_pass
    uvicorn main:app --reload --host 0.0.0.0 --port 8006
    ```
 
@@ -241,11 +229,11 @@ CREATE TABLE geo_fences (
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `DB_HOST` | MySQL host | `localhost` | Yes |
-| `DB_PORT` | MySQL port | `3306` | Yes |
-| `DB_NAME` | Database name | `nilbx_db` | Yes |
-| `DB_USER` | Database user | `root` | Yes |
-| `DB_PASSWORD` | Database password | `rootpassword` | Yes |
+| `DB_HOST` | MySQL host | `checkin-db` (docker) / `localhost` | Yes |
+| `DB_PORT` | MySQL port | `3306` (in container) / `3307` (host) | Yes |
+| `DB_NAME` | Database name | `checkin_db` | Yes |
+| `DB_USER` | Database user | `checkin_user` | Yes |
+| `DB_PASSWORD` | Database password | `checkin_pass` | Yes |
 | `GOOGLE_MAPS_API_KEY` | Google Maps API key | - | No |
 | `TWITTER_API_KEY` | Twitter API key | - | No |
 | `FEATURE_FLAG_URL` | Feature flag service URL | `http://localhost:8004` | No |
