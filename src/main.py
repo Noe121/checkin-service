@@ -36,6 +36,25 @@ except ImportError:
 # Database configuration - Load from Secrets Manager
 SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-checkin-db-credentials")
 
+def _db_ssl_args() -> dict:
+    """Build SSL args for mysql.connector connections."""
+    import ssl as _ssl
+    host = os.getenv("DB_HOST", "localhost").strip().lower()
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    ssl_override = os.getenv("DB_SSL_ENABLED")
+    is_local = host in {"localhost", "127.0.0.1", "mysql", "checkin-mysql"}
+    if ssl_override is not None:
+        enabled = ssl_override.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = not (is_local and env in {"development", "local", "test"})
+    if not enabled:
+        return {}
+    ca = os.getenv("DB_SSL_CA_PATH", "/etc/ssl/certs/global-bundle.pem").strip()
+    if ca and os.path.isfile(ca):
+        return {"ssl_ca": ca, "ssl_verify_cert": True, "ssl_verify_identity": True}
+    return {"ssl_disabled": False}
+
+
 def _get_db_config():
     """Load database config from Secrets Manager."""
     try:
@@ -43,22 +62,26 @@ def _get_db_config():
         from shared.secrets_manager import get_db_credentials
         creds = get_db_credentials(SECRET_NAME)
         logger.info("✓ Loaded checkin database credentials from AWS Secrets Manager")
-        return {
+        config = {
             "host": creds['host'],
             "port": creds['port'],
             "user": creds['username'],
             "password": creds['password'],
             "database": creds['dbname']
         }
+        config.update(_db_ssl_args())
+        return config
     except Exception as e:
         logger.warning(f"Could not load from Secrets Manager: {e}. Using environment variables.")
-        return {
+        config = {
             "host": os.getenv("DB_HOST", "localhost"),
             "port": int(os.getenv("DB_PORT", 3306)),
             "user": os.getenv("DB_USER", "root"),
             "password": os.getenv("DB_PASSWORD", "rootpassword"),
             "database": os.getenv("DB_NAME", "nilbx_db")
         }
+        config.update(_db_ssl_args())
+        return config
 
 DB_CONFIG = _get_db_config()
 
