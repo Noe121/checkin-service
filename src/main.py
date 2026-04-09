@@ -23,15 +23,24 @@ logging.basicConfig(
 logger = logging.getLogger("checkin-service")
 logger.info("Check-in service starting up")
 
-# NIL Platform Middleware
+# NIL Platform Middleware (optional — not available in Docker containers)
+_HAS_SHARED_MIDDLEWARE = False
 try:
     from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+    _HAS_SHARED_MIDDLEWARE = True
 except ImportError:
-    from pathlib import Path
-    _repo_root = str(Path(__file__).resolve().parents[2])
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
-    from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+    try:
+        from pathlib import Path
+        _file_path = Path(__file__).resolve()
+        _repo_root = str(_file_path.parents[min(2, len(_file_path.parents) - 1)])
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        from shared.middleware import CorrelationMiddleware, IdempotencyMiddleware, InMemoryIdempotencyBackend
+        _HAS_SHARED_MIDDLEWARE = True
+    except (ImportError, IndexError):
+        CorrelationMiddleware = None
+        IdempotencyMiddleware = None
+        InMemoryIdempotencyBackend = None
 
 # Database configuration - Load from Secrets Manager
 SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-checkin-db-credentials")
@@ -126,10 +135,13 @@ app = FastAPI(
 )
 app.add_middleware(CSRFMiddleware)  # CSRF: cookie-authenticated mutating requests
 
-# NIL Platform Middleware
-app.add_middleware(CorrelationMiddleware)
-if os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true":
-    app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
+# NIL Platform Middleware (skip if shared module unavailable in Docker)
+if _HAS_SHARED_MIDDLEWARE and CorrelationMiddleware is not None:
+    app.add_middleware(CorrelationMiddleware)
+    if (os.getenv("IDEMPOTENCY_MIDDLEWARE_ENABLED", "false").lower() == "true"
+            and IdempotencyMiddleware is not None
+            and InMemoryIdempotencyBackend is not None):
+        app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
 
 def get_db():
