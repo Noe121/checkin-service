@@ -1,16 +1,25 @@
 """
 Check-in Service - Main FastAPI Application
-Handles event check-ins and attendance tracking
+Handles event check-ins and attendance tracking.
+
+Connects to nilbx_db (NOT a separate checkin_db). The generic events /
+event_registrations / event_checkins / qr_tokens tables added by V116
+live alongside the Greek-specific tables added by V108 + V115.
 """
 import os
 from datetime import datetime
-import requests
 import logging
 import sys
-import mysql.connector
 
-from fastapi import FastAPI, HTTPException, Header, Query, Depends, Body
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
+
+from .database import get_db, engine  # noqa: F401 — engine import warms the connection
+from .routers import checkins as checkins_router
+from .routers import eligible_groups as eligible_groups_router
+from .routers import events as events_router
+from .routers import event_invitations as event_invitations_router
+from .routers import qr_tokens as qr_tokens_router
+from .routers import registrations as registrations_router
 
 # Configure stdout logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -42,57 +51,10 @@ except ImportError:
         IdempotencyMiddleware = None
         InMemoryIdempotencyBackend = None
 
-# Database configuration - Load from Secrets Manager
-SECRET_NAME = os.getenv("DB_SECRET_NAME", "dev-checkin-db-credentials")
-
-def _db_ssl_args() -> dict:
-    """Build SSL args for mysql.connector connections."""
-    import ssl as _ssl
-    host = os.getenv("DB_HOST", "localhost").strip().lower()
-    env = os.getenv("ENVIRONMENT", "development").strip().lower()
-    ssl_override = os.getenv("DB_SSL_ENABLED")
-    is_local = host in {"localhost", "127.0.0.1", "mysql", "checkin-mysql"}
-    if ssl_override is not None:
-        enabled = ssl_override.strip().lower() in {"1", "true", "yes", "on"}
-    else:
-        enabled = not (is_local and env in {"development", "local", "test"})
-    if not enabled:
-        return {}
-    ca = os.getenv("DB_SSL_CA_PATH", "/etc/ssl/certs/global-bundle.pem").strip()
-    if ca and os.path.isfile(ca):
-        return {"ssl_ca": ca, "ssl_verify_cert": True, "ssl_verify_identity": True}
-    return {"ssl_disabled": False}
-
-
-def _get_db_config():
-    """Load database config from Secrets Manager."""
-    try:
-        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-        from shared.secrets_manager import get_db_credentials
-        creds = get_db_credentials(SECRET_NAME)
-        logger.info("✓ Loaded checkin database credentials from AWS Secrets Manager")
-        config = {
-            "host": creds['host'],
-            "port": creds['port'],
-            "user": creds['username'],
-            "password": creds['password'],
-            "database": creds['dbname']
-        }
-        config.update(_db_ssl_args())
-        return config
-    except Exception as e:
-        logger.warning(f"Could not load from Secrets Manager: {e}. Using environment variables.")
-        config = {
-            "host": os.getenv("DB_HOST", "localhost"),
-            "port": int(os.getenv("DB_PORT", 3306)),
-            "user": os.getenv("DB_USER", "root"),
-            "password": os.getenv("DB_PASSWORD", "rootpassword"),
-            "database": os.getenv("DB_NAME", "nilbx_db")
-        }
-        config.update(_db_ssl_args())
-        return config
-
-DB_CONFIG = _get_db_config()
+# Database connection lives in src/database.py (SQLAlchemy engine + session).
+# checkin-service connects to nilbx_db via the standard `dev-nilbx-db-credentials`
+# secret — there is no separate checkin_db. The previous mysql.connector
+# bootstrap was removed when the routers landed in Phase 2.
 
 # ===== FastAPI Setup =====
 
@@ -143,21 +105,16 @@ if _HAS_SHARED_MIDDLEWARE and CorrelationMiddleware is not None:
             and InMemoryIdempotencyBackend is not None):
         app.add_middleware(IdempotencyMiddleware, backend=InMemoryIdempotencyBackend())
 
-
-def get_db():
-    """Get database connection with proper cleanup"""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        logger.info("Database connection established")
-        yield conn
-    except mysql.connector.Error as err:
-        logger.error(f"Database connection failed: {err}")
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {err}")
-    finally:
-        if conn and conn.is_connected():
-            conn.close()
-            logger.info("Database connection closed")
+# Register routers
+app.include_router(events_router.router)
+app.include_router(registrations_router.router)
+app.include_router(checkins_router.router)
+app.include_router(qr_tokens_router.router)
+# Phase 10 — event invitations + /me/invitations
+app.include_router(event_invitations_router.event_invitations_router)
+app.include_router(event_invitations_router.me_invitations_router)
+# Phase 11 — eligible groups picker for the create-event UI
+app.include_router(eligible_groups_router.router)
 
 
 # ===== Health Check =====
@@ -173,13 +130,12 @@ def health_check():
 
 
 @app.get("/db-health")
-def database_health_check(db=Depends(get_db)):
+def database_health_check():
     """Database health check endpoint with connection test"""
+    from sqlalchemy import text
     try:
-        cursor = db.cursor()
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-        cursor.close()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return {
             "status": "healthy",
             "service": "checkin-service",
@@ -188,6 +144,7 @@ def database_health_check(db=Depends(get_db)):
         }
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
+        from fastapi import HTTPException
         raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
 
 

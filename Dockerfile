@@ -27,15 +27,23 @@ COPY --from=builder /install /usr/local
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 WORKDIR /app
 
-COPY --chown=appuser:appuser checkin-service/src/ .
+# Phase 4.1 fix (2026-04-11) — preserve the `src/` package directory so
+# relative imports inside src/main.py work. The previous flat layout
+# (`COPY checkin-service/src/ .`) put main.py at /app/main.py and broke
+# `from .database import ...` with "attempted relative import with no
+# known parent package". Mirroring crm-service's pattern.
+COPY --chown=appuser:appuser checkin-service/src/ ./src/
 
 USER appuser
 
-ENV DB_SSL_CA_PATH=/etc/ssl/certs/global-bundle.pem
+ENV DB_SSL_CA_PATH=/etc/ssl/certs/global-bundle.pem \
+    PYTHONPATH=/app
 
 EXPOSE 8006
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:8006/health || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006"]
+# Run main.py as a package member (`src.main`) so the relative imports
+# in src/main.py + src/routers/*.py + src/models/*.py resolve correctly.
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8006"]

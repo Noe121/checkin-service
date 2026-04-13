@@ -1,16 +1,29 @@
 # Check-in Service
 
-A FastAPI-based microservice for geo-fencing and social verification check-ins in the NILbx platform. This service enables users to check into sponsored deals at physical locations with GPS verification and social media proof-of-visit.
+FastAPI microservice for events, RSVPs, QR / NFC / geofence check-ins, and event invitations. Multi-tenant via `school_id`, with PII-hashed audit trail and HMAC-signed QR tokens. Connects to `nilbx_db` (NOT a separate `checkin_db`).
 
-## 🚀 Features
+## 🚀 Phase 10 features (Apr 2026)
 
-- **Geo-fencing Check-ins**: GPS-based location verification for sponsored deals
-- **Social Media Verification**: Instagram/Twitter post validation for proof-of-visit
-- **Real-time Payouts**: Automatic payment processing for verified check-ins
-- **Hotspot Management**: Dynamic geo-fence creation and management
-- **Feature Flags**: Configurable feature toggles via external service
-- **Health Monitoring**: Comprehensive health checks and metrics
-- **Database Integration**: MySQL 8.4 with service-owned `checkin_db` (no cross-service FKs)
+- **Non-fan event creators** — creators / brands / agencies / coaches / school admins / governing-body roles can all author events. Fans and guardians cannot. Event ownership flows to the caller via `events.owner_user_id`.
+- **4-tier visibility** —
+  - `public` — anyone signed in can discover + RSVP
+  - `school_only` — only authors with a real school binding can create; only same-school users can discover + RSVP
+  - `unlisted` — not in discover, but anyone with the link can RSVP
+  - `invite_only` — RSVP requires an accepted `event_invitations` row
+- **Event invitations** — organizer batch-sends invites; invitee accepts / declines via /me/invitations; idempotent on `(event_id, invitee_user_id)`.
+- **Phone-to-phone NFC tap** — explicit per-event `allow_nfc_checkin` opt-in; the existing /checkin endpoint accepts `checkin_method: "nfc"` once enabled. iOS CoreNFC reader / Android NfcAdapter HCE land in Phase 10.B.
+- **Public discovery feed** — `GET /api/checkin/events/discover` returns public + same-school events, paginated, with `event_type` filter. PII guard: omits raw lat/lon and owner_user_id.
+- **Owner-or-admin gate** — PATCH/DELETE event accepts the original organizer OR a same-school admin. Cross-tenant non-owners get 404 (existence-leak guard).
+
+## 🚀 Inherited Phase 2 features
+
+- **Capacity + waitlist** — `events.max_capacity` enforced on POST /register; overflow → `status='waitlisted'` with `waitlist_position`
+- **Idempotency-Key** — replay-safe POST /events + POST /register via per-tenant unique constraints
+- **HMAC-signed QR tokens** — two-phase verify (peek → geofence → consume) so a single-use token is NEVER burned by a failed geofence check. Token mint via POST /events/{id}/qr-tokens (admin only)
+- **Geofence verification** — Haversine distance with bounds checks; raw lat/lon NEVER persisted (rounded to ~100m + HMAC-hashed before write)
+- **PII hashing** — every API response with attendee data uses SHA-256[:8] hashed user IDs; raw IDs only echoed to admin-bypass roles
+- **Cross-tenant 404** — never 403; existence is never leaked to other schools
+- **CSRF middleware** — cookie-authed mutations require X-CSRF-Token (bearer-only callers bypass)
 
 ## 🏗️ Architecture
 
@@ -21,18 +34,45 @@ A FastAPI-based microservice for geo-fencing and social verification check-ins i
 - **Health Checks**: Integrated with feature flag service
 - **Containerized**: Docker with multi-stage builds
 
-### Data Flow
-1. **Check-in Creation**: Athlete submits location + deal ID
-2. **Geo Verification**: Haversine distance calculation against geo-fences
-3. **Social Proof**: URL validation for social media posts
-4. **Payout Trigger**: Automatic payment processing for verified check-ins
+### Data flow
+
+  Owner POST /events                       (creator/brand/coach/admin)
+       └→ event row in `events`
+  Owner POST /events/{id}/invitations      (optional, invite_only events)
+       └→ rows in `event_invitations`
+  Invitee POST /events/{id}/invitations/{iid}/respond
+       └→ status flips to accepted/declined
+  Attendee POST /events/{id}/register      (RSVP)
+       └→ row in `event_registrations`, capacity → waitlist
+  Attendee POST /events/{id}/checkin       (manual / qr / geo / qr_geo / nfc)
+       └→ row in `event_checkins`, lat/lon hashed to ~100m
+       └→ registration.status flipped to attended
+
+### Phase 10 API surface
+
+  POST   /api/checkin/events                              (event_creator)
+  GET    /api/checkin/events                              (admin only)
+  GET    /api/checkin/events/discover                     (any bearer)
+  GET    /api/checkin/events/{id}                         (admin only)
+  PATCH  /api/checkin/events/{id}                         (owner-or-admin)
+  DELETE /api/checkin/events/{id}                         (owner-or-admin)
+  POST   /api/checkin/events/{id}/qr-tokens               (admin only)
+  GET    /api/checkin/events/{id}/qr-tokens               (admin only)
+  POST   /api/checkin/events/{id}/register                (any bearer + visibility gate)
+  GET    /api/checkin/events/{id}/registrations           (admin only)
+  DELETE /api/checkin/events/{id}/registrations/{uid}     (self-or-admin)
+  POST   /api/checkin/events/{id}/checkin                 (self-or-admin + nfc opt-in)
+  POST   /api/checkin/events/{id}/invitations             (owner-or-admin)
+  GET    /api/checkin/events/{id}/invitations             (owner-or-admin)
+  POST   /api/checkin/events/{id}/invitations/{iid}/respond  (invitee only)
+  GET    /api/checkin/me/invitations                      (any bearer; own rows only)
 
 ## 📡 API Endpoints
 
 ### Core Endpoints
 
 #### `GET /health`
-Health check endpoint with feature flag status.
+Health check endpoint.
 
 **Response:**
 ```json
