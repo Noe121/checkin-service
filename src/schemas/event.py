@@ -1,10 +1,33 @@
 """Pydantic v2 schemas for event create/update/response."""
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# P1 fix (A02/A04) — Tighter geofence radius cap.
+#
+# Previously the schema allowed up to 5000m, which is wildly excessive
+# for any in-person event and makes GPS spoofing trivial (a 5km bubble
+# covers multiple neighborhoods). The new default cap is 500m. Operators
+# who legitimately need a wider radius (e.g. campus-wide rush events)
+# can set GEOFENCE_MAX_RADIUS_METERS in the service env to widen it
+# without a code change.
+def _geofence_max_radius() -> int:
+    raw = os.getenv("GEOFENCE_MAX_RADIUS_METERS", "500").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 500
+    if value < 10 or value > 5000:
+        return 500
+    return value
+
+
+_GEOFENCE_MAX = _geofence_max_radius()
 
 EventType = Literal["rush", "coach_clinic", "brand_activation", "agency_mixer", "generic"]
 EventStatus = Literal["draft", "published", "active", "completed", "cancelled"]
@@ -25,7 +48,7 @@ class EventCreate(BaseModel):
     location_name: Optional[str] = Field(default=None, max_length=200)
     latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
     longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
-    geofence_radius_m: Optional[int] = Field(default=100, ge=10, le=5000)
+    geofence_radius_m: Optional[int] = Field(default=100, ge=10, le=_GEOFENCE_MAX)
 
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -66,7 +89,7 @@ class EventUpdate(BaseModel):
     location_name: Optional[str] = Field(default=None, max_length=200)
     latitude: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
     longitude: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
-    geofence_radius_m: Optional[int] = Field(default=None, ge=10, le=5000)
+    geofence_radius_m: Optional[int] = Field(default=None, ge=10, le=_GEOFENCE_MAX)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     max_capacity: Optional[int] = Field(default=None, ge=1, le=100_000)

@@ -142,10 +142,13 @@ def database_health_check():
             "database": "connected",
             "timestamp": datetime.utcnow().isoformat()
         }
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
+    except Exception:
+        # P1 fix (A09) — never echo the underlying DB error to the wire.
+        # Full stack trace stays in service logs; client sees only an
+        # opaque machine-readable code.
+        logger.exception("db_health_check_failed")
         from fastapi import HTTPException
-        raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
+        raise HTTPException(status_code=503, detail={"code": "db_unhealthy"})
 
 
 if __name__ == "__main__":

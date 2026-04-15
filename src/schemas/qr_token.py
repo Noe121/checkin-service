@@ -10,6 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field
 class QrTokenMintRequest(BaseModel):
     ttl_minutes: int = Field(default=60, ge=1, le=720)  # 1 min .. 12 hours
     single_use: bool = True
+    # P1 fix (A04) — optional per-attendee QR binding. When supplied,
+    # the minted token will ONLY verify for a check-in where the
+    # claimed attendee matches. Admins can mint one bound token per
+    # registered PNM as a lightweight anti-sharing defense. Omit to
+    # preserve legacy event-scoped behavior (any registered attendee
+    # who presents the token passes QR verification).
+    attendee_user_id: Optional[str] = Field(default=None, max_length=36)
 
 
 class QrTokenMintResponse(BaseModel):

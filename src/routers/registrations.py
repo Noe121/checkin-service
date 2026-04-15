@@ -220,11 +220,42 @@ def register_for_event(
         if existing:
             return existing
 
-    # Capacity check — count current non-cancelled registrations.
-    # Waitlist if at capacity.
+    # P0 fix (A04) — Atomic capacity check.
+    #
+    # Previously COUNT() → check vs max_capacity → INSERT was three separate
+    # statements, so N concurrent requests could each read `count < capacity`
+    # and all insert, over-registering. The fix:
+    #
+    #   1. Row-lock the `events` row with SELECT ... FOR UPDATE so only one
+    #      request can own the capacity-check window at a time (MySQL-compat
+    #      and already used in the rest of nilbx_db for similar races).
+    #   2. Re-query the live active count INSIDE the lock.
+    #   3. Insert + commit, releasing the lock.
+    #
+    # SQLite in the test harness is a no-op for with_for_update(); the
+    # capacity check still runs correctly — the race is only reproducible
+    # under a real MySQL pool.
+    #
+    # TODO: a dedicated concurrency harness test for this path requires a
+    # thread pool and a real MySQL fixture — skipped for now, as the
+    # existing pytest stack is SQLite in-memory with StaticPool (serialized
+    # by design). Integration coverage should live in the e2e suite.
     waitlist_position: Optional[int] = None
     target_status = "registered"
-    if event.max_capacity is not None:
+
+    # Lock the event row before the capacity arithmetic + INSERT. If the
+    # row disappears between the earlier _resolve_event_or_404 and the
+    # lock acquisition, treat it as a 404 (event was deleted concurrently).
+    locked_event = (
+        db.query(Event)
+        .filter(Event.id == event_id)
+        .with_for_update()
+        .first()
+    )
+    if locked_event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if locked_event.max_capacity is not None:
         active_count = (
             db.query(func.count(EventRegistration.id))
             .filter(
@@ -234,7 +265,7 @@ def register_for_event(
             .scalar()
             or 0
         )
-        if active_count >= event.max_capacity:
+        if active_count >= locked_event.max_capacity:
             # Compute next waitlist position
             current_max = (
                 db.query(func.max(EventRegistration.waitlist_position))
@@ -249,7 +280,7 @@ def register_for_event(
 
     # Use the event's school_id (not the actor's, since fans don't have one).
     registration = EventRegistration(
-        school_id=event.school_id,
+        school_id=locked_event.school_id,
         event_id=event_id,
         attendee_user_id=target_user_id,
         status=target_status,
@@ -272,7 +303,7 @@ def register_for_event(
         )
         if existing:
             return existing
-        raise HTTPException(status_code=409, detail="duplicate registration")
+        raise HTTPException(status_code=409, detail={"code": "duplicate_registration"})
     db.refresh(registration)
     return registration
 

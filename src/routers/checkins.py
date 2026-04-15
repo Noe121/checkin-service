@@ -11,10 +11,13 @@ the canonical replay-safe pattern.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +25,12 @@ from ..auth import assert_self_or_admin, require_bearer_actor
 from ..database import get_db
 from ..models import Event, EventCheckin, EventRegistration
 from ..schemas.checkin import CheckinRequest, CheckinResponse
+from ..services.geo_verification import (
+    attestation_required,
+    ip_country_check,
+    velocity_check,
+    verify_device_attestation,
+)
 from ..services.geofence_service import hash_coordinate, verify_distance
 from ..services.hashing import sanitize_text, sha256_full
 from ..services.qr_token_service import (
@@ -34,6 +43,100 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/checkin/events", tags=["checkins"])
 
 
+# ── P1 fix (A04) — sliding-window rate limiter ──────────────────────
+#
+# Two independent windows guard the check-in endpoint:
+#
+#   (1) Per-(attendee, event) — 5 scans per 60s. Blocks a compromised or
+#       shared session from rapidly hammering the check-in flow for a
+#       single event (e.g. someone handing a phone around trying to
+#       probe QR tokens).
+#
+#   (2) Per client IP — 60 scans per 60s. Door staff may scan many
+#       attendees per minute; 60/min gives a legitimate operator
+#       headroom while still choking botnets that proxy through a
+#       single IP.
+#
+# The limiter is an in-memory deque per key. That is sufficient for a
+# single-task-per-event check-in service (the common case) and fails
+# open across task restarts — the tradeoff we pick over pulling in a
+# redis dependency. A cluster-wide limiter belongs in a shared cache
+# service and is out of scope here.
+_RL_LOCK = threading.Lock()
+_RL_ATTENDEE_EVENT: Dict[Tuple[str, int], Deque[float]] = {}
+_RL_IP: Dict[str, Deque[float]] = {}
+
+_RL_ATTENDEE_EVENT_WINDOW_S = 60.0
+_RL_ATTENDEE_EVENT_MAX = 5
+
+_RL_IP_WINDOW_S = 60.0
+_RL_IP_MAX = 60
+
+
+def _prune(dq: Deque[float], now: float, window: float) -> None:
+    cutoff = now - window
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+
+def _rate_limit(
+    *,
+    attendee_user_id: str,
+    event_id: int,
+    client_ip: Optional[str],
+) -> Optional[Tuple[str, int]]:
+    """Returns (code, retry_after_seconds) when the caller is throttled,
+    otherwise None. Caller should raise 429 with Retry-After when set."""
+    now = time.monotonic()
+    with _RL_LOCK:
+        # (1) per-(attendee, event)
+        key_ae = (str(attendee_user_id), int(event_id))
+        dq_ae = _RL_ATTENDEE_EVENT.setdefault(key_ae, deque())
+        _prune(dq_ae, now, _RL_ATTENDEE_EVENT_WINDOW_S)
+        if len(dq_ae) >= _RL_ATTENDEE_EVENT_MAX:
+            retry = int(_RL_ATTENDEE_EVENT_WINDOW_S - (now - dq_ae[0])) + 1
+            return "rate_limited_attendee", max(retry, 1)
+
+        # (2) per client IP
+        if client_ip:
+            dq_ip = _RL_IP.setdefault(client_ip, deque())
+            _prune(dq_ip, now, _RL_IP_WINDOW_S)
+            if len(dq_ip) >= _RL_IP_MAX:
+                retry = int(_RL_IP_WINDOW_S - (now - dq_ip[0])) + 1
+                return "rate_limited_ip", max(retry, 1)
+            dq_ip.append(now)
+
+        dq_ae.append(now)
+    return None
+
+
+def _reset_rate_limiter_state() -> None:
+    """Test-only helper: wipe the module-level sliding-window state.
+
+    The limiter stores per-key deques in process memory, so state
+    persists across requests — which is the point in production but
+    noisy in test suites that run many checkin POSTs against the
+    same fixture actors. The pytest conftest calls this between
+    tests to keep the fixture shape stable.
+    """
+    with _RL_LOCK:
+        _RL_ATTENDEE_EVENT.clear()
+        _RL_IP.clear()
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    """Best-effort client IP extraction. Prefers the X-Forwarded-For
+    leftmost entry (set by ALB / CloudFront) and falls back to the
+    socket peer address."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    client = request.client
+    return client.host if client else None
+
+
 @router.post(
     "/{event_id}/checkin",
     response_model=CheckinResponse,
@@ -42,6 +145,7 @@ router = APIRouter(prefix="/api/checkin/events", tags=["checkins"])
 def submit_checkin(
     event_id: int,
     payload: CheckinRequest,
+    request: Request,
     db: Session = Depends(get_db),
     actor: Dict[str, Any] = Depends(require_bearer_actor),
 ) -> CheckinResponse:
@@ -62,9 +166,43 @@ def submit_checkin(
     if not target_user_id:
         raise HTTPException(
             status_code=400,
-            detail="attendee_user_id is required when bearer actor has no user_id",
+            detail={"code": "attendee_user_id_required"},
         )
     assert_self_or_admin(actor, target_user_id)
+
+    # P1 fix (A04) — rate limit the check-in endpoint. Two sliding
+    # windows: per-(attendee, event) at 5/60s and per-IP at 60/60s.
+    # Throttled responses return 429 + Retry-After.
+    client_ip = _client_ip(request)
+    throttle = _rate_limit(
+        attendee_user_id=target_user_id,
+        event_id=event_id,
+        client_ip=client_ip,
+    )
+    if throttle is not None:
+        code, retry_after = throttle
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": code},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # P1 fix (A02/A04) — device attestation gate. When
+    # REQUIRE_DEVICE_ATTESTATION=true in the service env (and we are
+    # NOT in a dev SKIP shortcut), a device_attestation payload must
+    # be supplied and verify successfully.
+    if attestation_required():
+        att = payload.device_attestation
+        if att is None:
+            return CheckinResponse(status="attestation_missing")
+        ok, reject = verify_device_attestation(att.platform, att.token)
+        if not ok:
+            code = (reject or {}).get("code", "attestation_invalid")
+            if code == "attestation_not_implemented":
+                return CheckinResponse(status="attestation_not_implemented")
+            if code == "attestation_missing":
+                return CheckinResponse(status="attestation_missing")
+            return CheckinResponse(status="attestation_invalid")
 
     event = db.query(Event).filter(Event.id == event_id).first()
     if event is None:
@@ -72,6 +210,37 @@ def submit_checkin(
 
     if event.status not in {"published", "active"}:
         return CheckinResponse(status="event_not_active")
+
+    # P1 fix (A02/A04) — IP → coarse-geo cross-check. No-ops if the
+    # event row has no country column / the CDN did not set a viewer
+    # country header.
+    ip_ok, ip_reject = ip_country_check(
+        event=event,
+        headers={k: v for k, v in request.headers.items()},
+    )
+    if not ip_ok:
+        logger.info(
+            "checkin_ip_country_mismatch event=%s detail=%s",
+            event_id,
+            ip_reject,
+        )
+        return CheckinResponse(status="ip_country_mismatch")
+
+    # P1 fix (A02/A04) — velocity sanity check. If the attendee
+    # checked in at a different event venue within the last 2 hours
+    # and the implied travel speed exceeds 500 mph, reject.
+    vel_ok, vel_reject = velocity_check(
+        db,
+        attendee_user_id=target_user_id,
+        event=event,
+    )
+    if not vel_ok:
+        logger.info(
+            "checkin_velocity_implausible event=%s detail=%s",
+            event_id,
+            vel_reject,
+        )
+        return CheckinResponse(status="velocity_implausible")
 
     # Phase 10: the attendee can declare a method on the request body
     # (e.g. "nfc" for a phone-to-phone tap). If declared, the server
@@ -113,6 +282,7 @@ def submit_checkin(
             raw_token=payload.qr_token,
             event_id=event_id,
             event_table="events",
+            attendee_user_id=target_user_id,
         )
         if not peek_result.ok:
             logger.info(
@@ -120,6 +290,11 @@ def submit_checkin(
                 event_id,
                 peek_result.status,
             )
+            # P1 fix (A04) — surface attendee-binding mismatch with a
+            # distinct status so anti-sharing signals can be tracked
+            # separately from generic invalid tokens.
+            if peek_result.status == QrTokenVerifyResult.ATTENDEE_MISMATCH:
+                return CheckinResponse(status="attendee_mismatch")
             return CheckinResponse(status="invalid_token")
         qr_row = peek_result.qr_row
         qr_token_hash = sha256_full(payload.qr_token)

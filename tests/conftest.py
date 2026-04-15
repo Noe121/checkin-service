@@ -50,6 +50,12 @@ def db_session() -> Iterator[Session]:
     issuing DELETE FROM in reverse FK order. SQLite in-memory makes this
     a sub-millisecond operation for the 4 tables in this service.
     """
+    # Also reset the in-memory rate-limiter state — the checkin router
+    # keeps per-(attendee,event) and per-IP sliding windows in process
+    # memory, which leak across tests without this hook.
+    from src.routers.checkins import _reset_rate_limiter_state
+    _reset_rate_limiter_state()
+
     session = SessionLocal()
     try:
         # Wipe all rows from every ORM-declared table before the test runs.

@@ -55,6 +55,7 @@ def mint_qr_token(
         event_table="events",
         ttl_minutes=payload.ttl_minutes,
         single_use=payload.single_use,
+        attendee_user_id=payload.attendee_user_id,
     )
     return QrTokenMintResponse(
         qr_token_id=row.id,

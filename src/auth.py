@@ -44,6 +44,17 @@ AUTH_SERVICE_URL = os.getenv(
 # the greek_life_advisor.py proxy and any other internal caller.
 _INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
 
+# P1 fix (A07) — service-token callers must identify themselves via
+# `X-Service-Name`. The allowlist comes from SERVICE_TOKEN_ALLOWED_CALLERS
+# (comma-separated), mirroring the pattern established in
+# streaming-deliverable-service. An accepted service call is logged with
+# the caller name for audit; an unnamed or unknown caller gets 403.
+_SERVICE_TOKEN_ALLOWED_CALLERS: Set[str] = {
+    name.strip().lower()
+    for name in os.getenv("SERVICE_TOKEN_ALLOWED_CALLERS", "").split(",")
+    if name.strip()
+}
+
 # Roles that get blanket admin access to check-in management routes
 # (event create/list/update/delete, QR token mint, registration list).
 # Mirrors the bypass set used by other school-side services.
@@ -185,14 +196,52 @@ def require_bearer_actor(
     request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
     x_service_token: Optional[str] = Header(default=None, alias="X-Service-Token"),
+    x_service_name: Optional[str] = Header(default=None, alias="X-Service-Name"),
 ) -> Dict[str, Any]:
     """Resolve an actor from either:
       1. An internal X-Service-Token (matches INTERNAL_SERVICE_TOKEN env)
       2. A Bearer JWT validated by auth-service /validate-token
 
     Raises 401 if neither is present or valid.
+
+    P1 fix (A07) — service-token callers must additionally send an
+    `X-Service-Name` header that is present in the
+    SERVICE_TOKEN_ALLOWED_CALLERS allowlist. The accepted service
+    call is logged with the caller name. This mirrors the audit
+    pattern used in streaming-deliverable-service.
     """
     if _INTERNAL_SERVICE_TOKEN and x_service_token and x_service_token == _INTERNAL_SERVICE_TOKEN:
+        service_name = (x_service_name or "").strip().lower()
+        if not service_name:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "service_name_required",
+                    "reason": "Service-token callers must identify themselves via X-Service-Name",
+                },
+            )
+        # If the allowlist is configured, enforce it. If the env is
+        # unset we log-only so dev environments without a configured
+        # allowlist keep working — prod deploys must set the env.
+        if _SERVICE_TOKEN_ALLOWED_CALLERS and service_name not in _SERVICE_TOKEN_ALLOWED_CALLERS:
+            logger.warning(
+                "service_call_rejected caller=%s path=%s",
+                service_name,
+                request.url.path,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "service_caller_not_allowlisted",
+                    "caller": service_name,
+                },
+            )
+        logger.info(
+            "service_call_accepted caller=%s method=%s path=%s",
+            service_name,
+            request.method,
+            request.url.path,
+        )
         return {
             "user_id": None,
             "role": "service",
@@ -201,6 +250,7 @@ def require_bearer_actor(
             "email": None,
             "permissions": [],
             "auth_mode": "service_token",
+            "service_name": service_name,
         }
 
     if creds is None or creds.scheme.lower() != "bearer" or not creds.credentials:

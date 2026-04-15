@@ -27,6 +27,40 @@ _MAX_TTL_MINUTES = 12 * 60  # 12 hours — outer bound on rush event door tokens
 _VALID_EVENT_TABLES = {"events", "greek_rush_events"}
 
 
+# P1 fix (A04) — optional per-attendee QR binding.
+#
+# The legacy token shape is
+#     "{event_table}:{event_id}:{nonce}:{expires_unix}:{sig}"
+# which is event-scoped only — any attendee who presents a valid token
+# passes the QR check. Full per-attendee issuance (one unique token per
+# registered PNM) is a larger change: the admin tablet needs a way to
+# mint N tokens and map each to an attendee.
+#
+# As a compromise we extend the mint/verify pipeline to accept an
+# OPTIONAL `attendee_user_id`. When supplied, it is embedded into the
+# signed payload and the verifier requires a constant-time match against
+# the check-in attempt's attendee. Existing event-scoped tokens (emitted
+# without an attendee) continue to work unchanged.
+#
+# New token shape when attendee is bound:
+#     "{event_table}:{event_id}:{nonce}:{expires_unix}:a={hashed_att}:{sig}"
+#
+# The attendee component is hashed (sha256 hex, truncated to 16 chars) so
+# a stolen raw token does not leak the attendee_user_id. The server
+# rehashes the claimed attendee at verify time and constant-time compares.
+
+import hashlib as _hashlib
+import hmac as _hmac
+
+
+_ATTENDEE_PREFIX = "a="
+_ATTENDEE_HASH_LEN = 16
+
+
+def _hash_attendee(attendee_user_id: str) -> str:
+    return _hashlib.sha256(str(attendee_user_id).encode("utf-8")).hexdigest()[:_ATTENDEE_HASH_LEN]
+
+
 def mint_token(
     db: Session,
     *,
@@ -36,12 +70,22 @@ def mint_token(
     event_table: str = "events",
     ttl_minutes: int = _DEFAULT_TTL_MINUTES,
     single_use: bool = True,
+    attendee_user_id: Optional[str] = None,
 ) -> tuple[str, QrToken]:
     """Mint a new HMAC-signed QR token for an event.
 
     `event_table` is the polymorphic discriminator: 'events' (generic,
     used by checkin-service) or 'greek_rush_events' (used by
     greek_life_advisor.py when it adopts this service in Phase 3).
+
+    `attendee_user_id` (P1 fix, A04): when supplied, the token is
+    bound to a specific attendee. A check-in request that presents
+    this token MUST match the embedded attendee or the token is
+    rejected with EVENT_MISMATCH. When omitted, the token is
+    event-scoped (legacy behavior) — any registered attendee can use
+    it. Per-attendee issuance is a best-effort hardening; full
+    per-PNM QR issuance (one unique token per RSVP) is a larger
+    redesign that would require an admin UI to bulk-mint and map.
 
     Returns `(raw_token, qr_token_row)`. The raw token is the only time
     the caller will see the unhashed value — it should be encoded into a
@@ -62,6 +106,8 @@ def mint_token(
         f"{event_table}{_TOKEN_DELIM}{event_id}"
         f"{_TOKEN_DELIM}{nonce}{_TOKEN_DELIM}{expires_unix}"
     )
+    if attendee_user_id:
+        payload = f"{payload}{_TOKEN_DELIM}{_ATTENDEE_PREFIX}{_hash_attendee(attendee_user_id)}"
     signature = hmac_sign(payload)
     raw_token = f"{payload}{_TOKEN_DELIM}{signature}"
     token_hash = sha256_full(raw_token)
@@ -94,6 +140,7 @@ class QrTokenVerifyResult:
     NOT_FOUND = "not_found"
     EVENT_MISMATCH = "event_mismatch"
     ALREADY_USED = "already_used"
+    ATTENDEE_MISMATCH = "attendee_mismatch"
 
     def __init__(self, status: str, qr_row: Optional[QrToken] = None) -> None:
         self.status = status
@@ -112,6 +159,7 @@ def verify_token(
     event_table: str = "events",
     redeeming_user_id: Optional[str] = None,
     consume: bool = True,
+    attendee_user_id: Optional[str] = None,
 ) -> QrTokenVerifyResult:
     """Verify an incoming QR token.
 
@@ -133,10 +181,31 @@ def verify_token(
         return QrTokenVerifyResult(QrTokenVerifyResult.INVALID_FORMAT)
 
     parts = raw_token.split(_TOKEN_DELIM)
-    if len(parts) != 5:
+    # Legacy (event-scoped): 5 segments. Attendee-bound: 6 segments
+    # with an `a=<hash>` fragment before the signature.
+    if len(parts) == 5:
+        (
+            token_event_table,
+            token_event_id_str,
+            nonce,
+            expires_unix_str,
+            signature,
+        ) = parts
+        token_attendee_fragment: Optional[str] = None
+    elif len(parts) == 6:
+        (
+            token_event_table,
+            token_event_id_str,
+            nonce,
+            expires_unix_str,
+            token_attendee_fragment,
+            signature,
+        ) = parts
+        if not token_attendee_fragment.startswith(_ATTENDEE_PREFIX):
+            return QrTokenVerifyResult(QrTokenVerifyResult.INVALID_FORMAT)
+    else:
         return QrTokenVerifyResult(QrTokenVerifyResult.INVALID_FORMAT)
 
-    token_event_table, token_event_id_str, nonce, expires_unix_str, signature = parts
     if token_event_table not in _VALID_EVENT_TABLES:
         return QrTokenVerifyResult(QrTokenVerifyResult.INVALID_FORMAT)
     try:
@@ -152,8 +221,19 @@ def verify_token(
         f"{token_event_table}{_TOKEN_DELIM}{token_event_id}"
         f"{_TOKEN_DELIM}{nonce}{_TOKEN_DELIM}{expires_unix}"
     )
+    if token_attendee_fragment is not None:
+        payload = f"{payload}{_TOKEN_DELIM}{token_attendee_fragment}"
     if not hmac_verify(payload, signature):
         return QrTokenVerifyResult(QrTokenVerifyResult.SIGNATURE_MISMATCH)
+
+    # P1 fix (A04) — attendee-bound token must match the claimed attendee.
+    if token_attendee_fragment is not None:
+        expected = token_attendee_fragment[len(_ATTENDEE_PREFIX):]
+        if not attendee_user_id:
+            return QrTokenVerifyResult(QrTokenVerifyResult.ATTENDEE_MISMATCH)
+        actual = _hash_attendee(attendee_user_id)
+        if not _hmac.compare_digest(expected, actual):
+            return QrTokenVerifyResult(QrTokenVerifyResult.ATTENDEE_MISMATCH)
 
     if expires_unix < int(time.time()):
         return QrTokenVerifyResult(QrTokenVerifyResult.EXPIRED)
@@ -180,13 +260,15 @@ def peek_token(
     raw_token: str,
     event_id: int,
     event_table: str = "events",
+    attendee_user_id: Optional[str] = None,
 ) -> QrTokenVerifyResult:
     """Read-only QR token verification.
 
     Same checks as verify_token (HMAC signature, expiry, single-use status,
-    event match) but does NOT mark the row as used. The check-in router
-    uses this for the FIRST validation pass, then runs geofence + insert,
-    and only calls consume_token() once everything else has succeeded.
+    event match, optional attendee binding) but does NOT mark the row as
+    used. The check-in router uses this for the FIRST validation pass,
+    then runs geofence + insert, and only calls consume_token() once
+    everything else has succeeded.
     """
     return verify_token(
         db,
@@ -194,6 +276,7 @@ def peek_token(
         event_id=event_id,
         event_table=event_table,
         consume=False,
+        attendee_user_id=attendee_user_id,
     )
 
 

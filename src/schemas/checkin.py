@@ -9,6 +9,20 @@ from pydantic import BaseModel, ConfigDict, Field
 CheckinMethodAudit = Literal["manual", "qr", "geo", "qr_geo", "nfc"]
 
 
+class DeviceAttestation(BaseModel):
+    """Optional mobile attestation payload.
+
+    P1 fix (A02/A04) — see src/services/geo_verification.py for the
+    full design. `platform` is the client OS family; `token` is the
+    raw DeviceCheck (iOS) or Play Integrity (Android) token. Real
+    verification is a TODO stub; the field exists today so mobile
+    clients can start sending it.
+    """
+
+    platform: Literal["ios", "android"]
+    token: str = Field(min_length=1, max_length=4096)
+
+
 class CheckinRequest(BaseModel):
     """Body for POST /api/checkin/events/{event_id}/checkin.
 
@@ -36,6 +50,9 @@ class CheckinRequest(BaseModel):
     lon: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
     notes: Optional[str] = Field(default=None, max_length=500)
     checkin_method: Optional[CheckinMethodAudit] = None
+    # P1 fix (A02/A04) — optional device attestation payload. Required
+    # only when REQUIRE_DEVICE_ATTESTATION=true in the service env.
+    device_attestation: Optional[DeviceAttestation] = None
 
 
 class CheckinResponse(BaseModel):
@@ -54,6 +71,13 @@ class CheckinResponse(BaseModel):
         "invalid_token",
         "event_not_active",
         "registration_required",
+        # P1 fix (A02/A04) — multi-signal GPS spoofing defenses
+        "velocity_implausible",
+        "ip_country_mismatch",
+        "attestation_missing",
+        "attestation_not_implemented",
+        "attestation_invalid",
+        "attendee_mismatch",
     ]
     geofence_passed: Optional[bool] = None
     distance_m: Optional[float] = None
